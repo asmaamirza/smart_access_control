@@ -1,7 +1,8 @@
 # Smart Access Control System
-**CSCI435 — Computer Vision Algorithms and Systems**
+**CSCI435 — Computer Vision Algorithms and Systems**  
+University of Wollongong in Dubai
 
-A Streamlit web application that performs intelligent door/entry access control using five computer vision techniques.
+A deployable Streamlit web application that implements enterprise-grade physical access control using **10 integrated computer vision techniques**, a two-factor authentication terminal, anti-spoofing liveness detection, a threat blacklist, and a role-based access decision engine.
 
 ---
 
@@ -9,60 +10,76 @@ A Streamlit web application that performs intelligent door/entry access control 
 
 | # | Capability | Implementation |
 |---|---|---|
-| 1 | Face Detection | HOG detector via `face_recognition` (dlib ResNet) |
-| 2 | Face Recognition | 128-d face embeddings + **KNN classifier trained on custom data** |
-| 3 | Person Tracking | YOLOv8n + ByteTrack multi-object tracker |
-| 4 | Background Modelling | MOG2 Gaussian Mixture Model (live camera feed) |
-| 5 | Image Enhancement | CLAHE on LAB luminance channel |
+| 1 | Image enhancement | CLAHE on CIE-LAB luminance channel — normalises uneven lighting before detection |
+| 2 | Edge detection | Canny on aligned 64×64 face chip — part of KNN feature vector |
+| 3 | Keypoint detection | dlib 68-point facial landmark predictor — eyes, nose, mouth |
+| 4 | Object detection | YOLOv8n (COCO-pretrained) — person detection for tailgating |
+| 5 | Object recognition | dlib ResNet-34 128-d face embedding + Euclidean distance matching |
+| 6 | Face detection / recognition | HOG+SVM detector + ResNet identity matching |
+| 7 | Video processing | Frame-by-frame webcam loop with `@st.fragment`; motion-gated recognition |
+| 8 | Change detection & background modelling | MOG2 Gaussian Mixture Model foreground/background separation |
+| 9 | Object tracking | ByteTrack multi-person tracker with persistent track IDs; tailgating detection |
+| 10 | Binary morphological operations | Dilate + erode on MOG2 foreground mask to remove noise |
 
 ---
 
 ## Requirements
 
 - **Python 3.10 – 3.13**
-- A webcam (for Live Camera mode)
-- ~2 GB free disk space (PyTorch + dlib + YOLOv8 weights)
+- A webcam (for Live Camera and Security Terminal)
+- ~2 GB free disk space (dlib models + YOLOv8 weights)
+- Windows, macOS, or Linux
 
 ---
 
 ## Installation
 
-### Option A — pip (recommended, works on Windows/macOS/Linux)
+### Step 1 — Clone the repository
 
 ```bash
-# 1. Create and activate a virtual environment
-python -m venv .venv
+git clone https://github.com/asmaamirza/smart_access_control.git
+cd smart_access_control
+```
 
+### Step 2 — Create a virtual environment
+
+```bash
 # Windows
+python -m venv .venv
 .venv\Scripts\activate
 
 # macOS / Linux
+python -m venv .venv
 source .venv/bin/activate
-
-# 2. Install all dependencies
-pip install -r requirements.txt
 ```
 
-> **Windows note:** If `dlib` (pulled in by `face-recognition`) fails to build,
-> install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-> (select the **C++ Desktop Development** workload) then run `pip install cmake dlib`
-> before installing the rest.
-
-### Option B — Conda (easiest on Windows if Option A fails)
+### Step 3 — Install dependencies
 
 ```bash
-conda create -n access_control python=3.10
-conda activate access_control
-conda install -c conda-forge dlib
 pip install -r requirements.txt
 ```
+
+> **Windows — dlib build failure?**  
+> If `face-recognition` fails to install, first run:
+> ```bash
+> pip install cmake
+> pip install dlib
+> ```
+> If that still fails, install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload selected, then retry.
+
+> **Conda alternative (easiest on Windows):**
+> ```bash
+> conda create -n access_control python=3.10
+> conda activate access_control
+> conda install -c conda-forge dlib
+> pip install -r requirements.txt
+> ```
 
 ---
 
 ## Running the App
 
 ```bash
-# Make sure your virtual environment is active, then:
 streamlit run app.py
 ```
 
@@ -70,26 +87,74 @@ The app opens automatically at `http://localhost:8501`.
 
 ---
 
-## Usage
+## Pages and Usage
 
-### 1. Enroll Faces
-- Go to **Enroll Faces** in the sidebar.
-- Enter a person's name and upload 3–5 clear, front-facing photos.
-- Repeat for every authorised person.
-- Click **Train KNN Classifier** — this extracts face embeddings and fits the classifier.
+### Home
+Overview of the full vision pipeline, all roles, and quick-start guide.
 
-### 2. Analyze an Image
-- Go to **Analyze Image** and upload a JPG/PNG.
-- Click **Run Analysis** to see face recognition, person tracking, and tailgating detection.
+### Security Terminal *(two-factor authentication)*
+1. Enter your **username** and **password** — credentials are verified first.
+2. If valid, the webcam activates for **face verification** against your enrolled encoding (1-vs-1 match, not a database scan).
+3. **Blink once** to confirm liveness (EAR blink detection).
+4. System runs the blacklist check on your face first — a blacklisted individual using stolen credentials is caught here.
+5. Result: **ACCESS GRANTED** (green) or **SECURITY ALERT / ACCESS DENIED** (red).
 
-### 3. Live Camera
-- Go to **Live Camera** and click **START**.
-- Allow browser camera access when prompted.
-- Face boxes and ACCESS GRANTED / DENIED decisions appear as overlays in real time.
-- Adjust the **Recognition rate** slider to balance responsiveness vs CPU usage.
+### Register User
+Three tabs:
 
-### 4. View the Access Log
-- Go to **Access Log** to see all timestamped recognition events.
+| Tab | Purpose |
+|---|---|
+| **Enroll Authorized User** | Create an `admin` or `authorized` account with username, password (min 8 chars, upper+lower+special), and 3–5 face photos |
+| **Blacklist Entry** | Add a threat individual by name, threat reason, and face photos — no credentials required |
+| **Bulk Import** | Import multiple users from the Pins Face Recognition dataset |
+
+After enrolment the KNN classifier is automatically retrained on all enrolled face images.
+
+### Identify: Image
+Upload a JPG/PNG and run the full pipeline in one click:
+- CLAHE → HOG detection → ResNet matching → anti-spoofing → RBAC decision
+- Shows annotated result image, access decision, KNN secondary verification, and intermediate CV outputs (Canny edge map, LBP texture, HOG gradients)
+
+### Live Camera
+Real-time webcam feed with full pipeline:
+- Start/Stop controls, security mode slider (strict / normal / relaxed), landmark toggle
+- Frame-skip sliders for face recognition and YOLO intervals
+- Live FPS counter, blink counter, and pipeline stage indicator
+- Tailgating alert when more than one person is tracked simultaneously
+
+### Admin Panel
+- View system stats (total users, ALLOW/DENY/ALERT counts)
+- Retrain the KNN classifier manually
+- Change user roles or remove users
+- View and remove blacklist entries
+
+### Access Log
+Searchable, filterable table of every access event with timestamp, name, role, confidence, action, and source (image / live / terminal).
+
+---
+
+## Security Modes
+
+| Mode | Max Distance | Min Confidence | Use Case |
+|---|---|---|---|
+| Strict | 0.50 | 40% | High-security environments |
+| Normal | 0.60 | 25% | Standard operation |
+| Relaxed | 0.70 | 12% | Demo / low-risk |
+
+---
+
+## Pipeline Order (all modes)
+
+```
+Frame → CLAHE → MOG2 motion gate → HOG face detect
+      → BLACKLIST CHECK FIRST (0.50 threshold, always strict)
+         ↳ Match → ALERT + stop
+         ↳ No match → ResNet 1-vs-1 verify (Terminal) or full-DB search (Live/Image)
+      → Anti-spoofing (EAR blink + LBP texture + Laplacian sharpness)
+      → RBAC decision (ALLOW / DENY / ALERT)
+      → YOLOv8n + ByteTrack tailgating check
+      → Log to SQLite
+```
 
 ---
 
@@ -97,51 +162,56 @@ The app opens automatically at `http://localhost:8501`.
 
 ```
 smart_access_control/
-├── app.py                      # Streamlit application (all pages)
-├── requirements.txt            # Python dependencies
-├── README.md
+├── app.py                      # All seven pages and pipeline orchestration
+├── requirements.txt
+├── yolov8n.pt                  # YOLOv8n weights (COCO-pretrained, ~6 MB)
 ├── modules/
-│   ├── face_recognizer.py      # Face detection + KNN recognition
-│   ├── person_tracker.py       # YOLOv8 + ByteTrack person tracking
-│   ├── background_model.py     # MOG2 background subtraction + CLAHE
-│   └── utils.py                # Drawing helpers + CSV access log
-├── known_faces/                # Enrolled face images — created at runtime
-├── models/                     # Saved KNN classifier — created after training
-└── logs/                       # access_log.csv — created at runtime
+│   ├── anti_spoofing.py        # EAR blink detection, LBP texture, Laplacian sharpness
+│   ├── background_model.py     # CLAHE + MOG2 + morphological cleanup
+│   ├── database.py             # SQLite CRUD — users, blacklist, access_log tables
+│   ├── face_recognizer.py      # HOG detect + ResNet embed + blacklist check + 1-vs-1 verify
+│   ├── feature_extractor.py    # Face alignment, Canny, LBP, HOG → feature vector
+│   ├── knn_engine.py           # KNN train/predict on Canny+LBP+HOG features (custom data)
+│   ├── person_tracker.py       # YOLOv8n + ByteTrack tailgating detection
+│   ├── rbac_engine.py          # ALLOW / DENY / ALERT role-based decisions
+│   └── utils.py                # OpenCV annotation helpers
+├── database/
+│   └── access_control.db       # SQLite database (auto-created on first run)
+├── known_faces/<username>/     # Enrolled face images (auto-created on enrolment)
+└── models/
+    ├── knn_classifier.pkl      # Trained KNN (auto-generated after enrolment)
+    └── label_encoder.pkl       # Label encoder (auto-generated after enrolment)
 ```
 
-> `known_faces/`, `models/`, and `logs/` are created automatically the first time
-> you enroll a face or run an analysis. You do not need to create them manually.
+> `database/`, `known_faces/`, and `models/` are created automatically. You do not need to create them manually.
 
 ---
 
-## Technical Notes
+## Models Used
 
-**Pre-trained model:** dlib's ResNet (via `face_recognition`) extracts 128-dimensional face embeddings. This model is bundled with the `face-recognition-models` package and does not require a separate download.
+| Model | Type | Source | Purpose |
+|---|---|---|---|
+| dlib HOG+SVM | Pre-trained | `face_recognition_models` | Face bounding box detection |
+| dlib ResNet-34 | Pre-trained | `face_recognition_models` | 128-d face embedding (LFW 99.38%) |
+| dlib shape predictor | Pre-trained | `face_recognition_models` | 68 facial landmark keypoints |
+| KNN Classifier | **Trained on custom data** | scikit-learn, trained at runtime | Secondary identity verification (Canny+LBP+HOG features) |
+| YOLOv8n | Pre-trained (COCO) | Ultralytics | Person detection for tailgating |
+| MOG2 | Statistical model | OpenCV | Background subtraction, motion gating |
 
-**Custom-trained model:** A `KNeighborsClassifier` (sklearn) is fitted on the embeddings extracted from enrolled photos. This is trained entirely on user-provided custom data and saved to `models/knn_classifier.pkl`.
-
-**Access decision (double-gate):** A face is only identified as a known person when *both* the KNN confidence score ≥ 0.75 **and** the raw embedding distance to the nearest training sample ≤ 0.45. This prevents the classifier from approving out-of-distribution faces.
-
-**Tailgating detection:** triggered when YOLOv8 tracks more than one person in a single frame simultaneously.
-
-**CLAHE:** applied to the luminance channel (LAB colour space) before recognition to improve detection accuracy under uneven or low lighting.
-
-**YOLOv8 weights:** `yolov8n.pt` (~6 MB) is downloaded automatically by `ultralytics` on first run. An internet connection is required for this one-time download.
-
-**Live camera (WebRTC):** uses a Google STUN server for ICE negotiation. Works on local networks and direct connections. For cross-network deployments a TURN server would be needed.
+The **KNN classifier** is the project's custom-trained model: it is fitted from scratch on Canny+LBP+HOG feature vectors extracted from each enrolled user's face images. It retrains automatically on every new enrolment.
 
 ---
 
 ## Dependencies
 
-| Library | Purpose |
-|---|---|
-| `face_recognition` | Face detection and 128-d embeddings (wraps dlib) |
-| `scikit-learn` | KNN classifier |
-| `ultralytics` | YOLOv8 person detection and ByteTrack tracking |
-| `opencv-python` | MOG2, CLAHE, image I/O, frame drawing |
-| `streamlit` | Web interface |
-| `streamlit-webrtc` | Real-time WebRTC camera stream in the browser |
-| `av` | PyAV — video frame decoding/encoding for streamlit-webrtc |
-| `pandas` | Access log CSV handling |
+| Library | Version | Purpose |
+|---|---|---|
+| `streamlit` | ≥1.32 | Web interface and camera fragment |
+| `opencv-python` | ≥4.9 | CLAHE, MOG2, morphology, drawing |
+| `face-recognition` | ≥1.3 | dlib HOG detector + ResNet embeddings |
+| `numpy` | ≥1.24 | Array operations |
+| `scikit-learn` | ≥1.4 | KNN classifier |
+| `scikit-image` | ≥0.21 | LBP texture descriptor |
+| `ultralytics` | ≥8.1 | YOLOv8n + ByteTrack |
+| `Pillow` | ≥10.2 | Image decode for uploads |
+| `pandas` | ≥2.1 | Access log display |
