@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large model & binary files
+*.pt
+*.pkl
+*.zip
+
+# Runtime data (sensitive / auto-generated)
+database/
+logs/
+known_faces/
+
+# Archive
+archive/
+
+# OS files
+.DS_Store
+Thumbs.db
