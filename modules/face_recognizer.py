@@ -17,7 +17,10 @@ import os
 import numpy as np
 import face_recognition as fr
 
-from modules.database import get_all_face_encodings, update_face_encoding
+from modules.database import (
+    get_all_face_encodings, get_blacklist_encodings,
+    get_user_by_username, get_user_face_encoding, update_face_encoding,
+)
 
 # Distance at which confidence normalisation reaches 0 %
 _NORM_DIST = 0.80
@@ -104,6 +107,132 @@ def extract_encoding_from_array(rgb_image: np.ndarray) -> np.ndarray | None:
     """Extract a 128-d encoding from an RGB numpy array. Returns None if no face found."""
     encs = fr.face_encodings(rgb_image)
     return encs[0] if encs else None
+
+
+def recognize_with_blacklist_check(rgb_image: np.ndarray,
+                                   security_mode: str = "normal") -> list[dict]:
+    """
+    Detect faces and match them — blacklist is checked FIRST for every face.
+
+    If a face matches the blacklist it is flagged immediately; normal user
+    matching is skipped for that face entirely.
+
+    Returns list of dicts (same shape as recognize_faces, plus):
+        blacklisted          — True if face matched blacklist
+        blacklist_entry      — {id, name, threat_reason} or None
+        blacklist_confidence — float
+    """
+    dist_thresh = _DIST_THRESH.get(security_mode, 0.60)
+
+    face_locations = fr.face_locations(rgb_image, model="hog")
+    if not face_locations:
+        return []
+
+    face_encs        = fr.face_encodings(rgb_image, face_locations)
+    blacklist_entries = get_blacklist_encodings()
+    db_users          = get_all_face_encodings()
+
+    results = []
+    for (top, right, bottom, left), enc in zip(face_locations, face_encs):
+
+        # ── Priority 1: blacklist check ───────────────────────────────────────
+        is_bl    = False
+        bl_entry = None
+        bl_conf  = 0.0
+
+        if blacklist_entries:
+            bl_known = [e["encoding"] for e in blacklist_entries]
+            bl_dists = fr.face_distance(bl_known, enc)
+            bl_best  = int(np.argmin(bl_dists))
+            bl_dist  = float(bl_dists[bl_best])
+            bl_conf  = max(0.0, 1.0 - bl_dist / _NORM_DIST)
+            # Blacklist always uses strict threshold (0.50) regardless of security mode
+            if bl_dist <= 0.50:
+                is_bl    = True
+                bl_entry = blacklist_entries[bl_best]
+
+        if is_bl:
+            results.append({
+                "top": top, "right": right, "bottom": bottom, "left": left,
+                "match": None, "confidence": 0.0,
+                "blacklisted": True,
+                "blacklist_entry": bl_entry,
+                "blacklist_confidence": bl_conf,
+            })
+            continue   # do NOT compare against authorized users
+
+        # ── Priority 2: normal authorized-user matching ───────────────────────
+        match      = None
+        confidence = 0.0
+
+        if db_users:
+            known = [u["encoding"] for u in db_users]
+            dists = fr.face_distance(known, enc)
+            best  = int(np.argmin(dists))
+            dist  = float(dists[best])
+            confidence = max(0.0, 1.0 - dist / _NORM_DIST)
+            if dist <= dist_thresh:
+                match = db_users[best]
+
+        results.append({
+            "top": top, "right": right, "bottom": bottom, "left": left,
+            "match": match, "confidence": confidence,
+            "blacklisted": False,
+            "blacklist_entry": None,
+            "blacklist_confidence": 0.0,
+        })
+
+    return results
+
+
+def check_blacklist(face_enc: np.ndarray,
+                    dist_thresh: float = 0.50) -> tuple[bool, dict | None, float]:
+    """
+    Check a single pre-computed face encoding against all blacklist entries.
+    Returns (is_blacklisted, matched_entry, confidence).
+    Used by the Security Terminal pipeline.
+    """
+    entries = get_blacklist_encodings()
+    if not entries:
+        return False, None, 0.0
+
+    bl_known = [e["encoding"] for e in entries]
+    dists    = fr.face_distance(bl_known, face_enc)
+    best     = int(np.argmin(dists))
+    dist     = float(dists[best])
+    conf     = max(0.0, 1.0 - dist / _NORM_DIST)
+
+    if dist <= dist_thresh:
+        return True, entries[best], conf
+    return False, None, conf
+
+
+def verify_claimed_user(face_enc: np.ndarray, username: str,
+                        security_mode: str = "normal") -> tuple[dict | None, float]:
+    """
+    Verify face_enc matches the encoding stored for the claimed username.
+
+    This is a targeted 1-vs-1 match: much more efficient than comparing
+    against all enrolled users, and eliminates cross-user false positives.
+
+    Returns (user_dict, confidence) — user_dict is None if the face does not
+    match the claimed user within the current security mode threshold.
+    """
+    user = get_user_by_username(username)
+    if user is None:
+        return None, 0.0
+
+    stored_enc = get_user_face_encoding(username)
+    if stored_enc is None:
+        return None, 0.0
+
+    dist_thresh = _DIST_THRESH.get(security_mode, 0.60)
+    dist        = float(fr.face_distance([stored_enc], face_enc)[0])
+    confidence  = max(0.0, 1.0 - dist / _NORM_DIST)
+
+    if dist <= dist_thresh:
+        return {"username": user["username"], "name": user["name"], "role": user["role"]}, confidence
+    return None, confidence
 
 
 def enroll_from_folder(username: str, folder_path: str) -> tuple[bool, str]:

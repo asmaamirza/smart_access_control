@@ -4,18 +4,21 @@ Role-Based Access Control (RBAC) Engine
 
 Maps a face-recognition result to an access decision.
 
-Roles
------
-admin       → ALLOW   (full access; highlighted gold box)
+Authorized user roles
+---------------------
+admin       → ALLOW   (full access; gold box)
 authorized  → ALLOW   (standard access; green box)
-blacklisted → ALERT   (denied + security alert; red box + banner)
 unknown     → DENY    (no match or confidence below threshold; grey box)
+
+Blacklisted individuals are handled separately via make_blacklist_decision()
+before this engine is ever called.  They are threat entities stored in the
+blacklist table, not valid system users.
 
 Security modes — adjustable confidence threshold
 ------------------------------------------------
-strict   ≥ 0.60  (high-security; guards against impersonation)
-normal   ≥ 0.40  (standard operation)
-relaxed  ≥ 0.25  (permissive; demo / low-risk environments)
+strict   ≥ 0.40  (high-security; guards against impersonation)
+normal   ≥ 0.25  (standard operation)
+relaxed  ≥ 0.12  (permissive; demo / low-risk environments)
 """
 
 THRESHOLDS = {
@@ -28,15 +31,14 @@ THRESHOLDS = {
 ROLE_COLORS = {
     "admin":       (0, 215, 255),    # gold
     "authorized":  (0, 200, 0),      # green
-    "blacklisted": (0, 0, 220),      # red
+    "blacklisted": (0, 0, 220),      # red  (used by make_blacklist_decision)
     "unknown":     (160, 160, 160),  # grey
     "spoof":       (0, 80, 255),     # deep orange
 }
 
 ROLE_ACTIONS = {
-    "admin":       "ALLOW",
-    "authorized":  "ALLOW",
-    "blacklisted": "ALERT",
+    "admin":      "ALLOW",
+    "authorized": "ALLOW",
 }
 
 
@@ -87,13 +89,13 @@ def make_decision(match: dict | None, confidence: float,
             "label":  label,
         }
 
-    # ── Known user ────────────────────────────────────────────────────────────
+    # ── Known authorized/admin user ───────────────────────────────────────────
     role   = match["role"]
     action = ROLE_ACTIONS.get(role, "DENY")
     color  = ROLE_COLORS.get(role, ROLE_COLORS["unknown"])
 
-    badge = {"admin": " [ADMIN]", "blacklisted": " [BLACKLISTED]"}.get(role, "")
-    label = f"{match['name']}  {confidence:.0%}{badge}"
+    badge  = " [ADMIN]" if role == "admin" else ""
+    label  = f"{match['name']}  {confidence:.0%}{badge}"
 
     reason = (
         f"Role: {role} | Confidence: {confidence:.0%} | "
@@ -101,11 +103,29 @@ def make_decision(match: dict | None, confidence: float,
     )
 
     return {
-        "action": action,
-        "reason": reason,
-        "role":   role,
-        "color":  color,
-        "label":  label,
-        "name":   match["name"],
+        "action":   action,
+        "reason":   reason,
+        "role":     role,
+        "color":    color,
+        "label":    label,
+        "name":     match["name"],
         "username": match["username"],
+    }
+
+
+def make_blacklist_decision(entry: dict) -> dict:
+    """
+    Produce an ALERT decision for a face that matched the blacklist.
+    Called before any authorized-user RBAC logic — processing stops here.
+    """
+    name   = entry.get("name", "Unknown")
+    threat = entry.get("threat_reason", "Security threat")
+    return {
+        "action":   "ALERT",
+        "reason":   f"BLACKLISTED INDIVIDUAL — {threat}",
+        "role":     "blacklisted",
+        "color":    ROLE_COLORS["blacklisted"],
+        "label":    f"{name}  [BLACKLISTED]",
+        "name":     name,
+        "username": "",
     }

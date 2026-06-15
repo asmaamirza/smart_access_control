@@ -62,6 +62,15 @@ def init_db():
             tailgating    INTEGER DEFAULT 0,
             source        TEXT    DEFAULT 'image'
         );
+
+        CREATE TABLE IF NOT EXISTS blacklist (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT    NOT NULL,
+            threat_reason TEXT    NOT NULL DEFAULT 'Security threat',
+            notes         TEXT    DEFAULT '',
+            face_encoding BLOB,
+            created_at    TEXT    DEFAULT (datetime('now'))
+        );
     """)
     conn.commit()
     conn.close()
@@ -223,3 +232,81 @@ def get_log_stats() -> dict:
         "DENY":  stats.get("DENY",  0),
         "ALERT": stats.get("ALERT", 0),
     }
+
+
+# ── User face encoding helper ─────────────────────────────────────────────────
+
+def get_user_face_encoding(username: str):
+    """Return the decoded numpy face encoding for a user, or None."""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT face_encoding FROM users WHERE username=?", (username,)
+    ).fetchone()
+    conn.close()
+    if row is None or row["face_encoding"] is None:
+        return None
+    return pickle.loads(row["face_encoding"])
+
+
+# ── Blacklist management ──────────────────────────────────────────────────────
+
+def create_blacklist_entry(name: str, threat_reason: str,
+                           notes: str = "", face_encoding=None) -> tuple[bool, str]:
+    """Add a new blacklist entry. Returns (success, message)."""
+    enc_blob = pickle.dumps(np.array(face_encoding)) if face_encoding is not None else None
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO blacklist (name, threat_reason, notes, face_encoding) "
+            "VALUES (?, ?, ?, ?)",
+            (name.strip(), threat_reason.strip(), notes.strip(), enc_blob),
+        )
+        conn.commit()
+        return True, f"'{name}' added to blacklist."
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def get_all_blacklist_entries() -> list[dict]:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, name, threat_reason, notes, created_at FROM blacklist ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_blacklist_encodings() -> list[dict]:
+    """Return [{id, name, threat_reason, encoding}] for every blacklist entry with a stored encoding."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, name, threat_reason, face_encoding FROM blacklist "
+        "WHERE face_encoding IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        enc = pickle.loads(r["face_encoding"])
+        result.append({
+            "id":           r["id"],
+            "name":         r["name"],
+            "threat_reason": r["threat_reason"],
+            "encoding":     enc,
+        })
+    return result
+
+
+def delete_blacklist_entry(entry_id: int) -> None:
+    conn = _connect()
+    conn.execute("DELETE FROM blacklist WHERE id=?", (entry_id,))
+    conn.commit()
+    conn.close()
+
+
+def blacklist_count() -> int:
+    conn = _connect()
+    n = conn.execute("SELECT COUNT(*) FROM blacklist").fetchone()[0]
+    conn.close()
+    return n

@@ -16,15 +16,19 @@ import streamlit as st
 from modules.anti_spoofing    import BlinkTracker, static_spoof_check
 from modules.background_model import apply_clahe, detect_motion, reset_background_model
 from modules.database         import (
-    clear_access_log, create_user, delete_user, get_access_log, get_all_users,
-    get_log_stats, init_db, log_access_event, update_role, update_face_encoding,
-    user_count,
+    blacklist_count, clear_access_log, create_blacklist_entry, create_user,
+    delete_blacklist_entry, delete_user, get_access_log, get_all_blacklist_entries,
+    get_all_users, get_log_stats, init_db, log_access_event, update_role,
+    update_face_encoding, user_count, verify_credentials,
 )
-from modules.face_recognizer  import extract_average_encoding, recognize_faces
+from modules.face_recognizer  import (
+    check_blacklist, extract_average_encoding, recognize_with_blacklist_check,
+    verify_claimed_user,
+)
 from modules.feature_extractor import extract_all
 from modules.knn_engine        import knn_info, knn_is_ready, predict_knn, train_knn
 from modules.person_tracker    import detect_and_track, reset_tracker
-from modules.rbac_engine       import make_decision
+from modules.rbac_engine       import make_blacklist_decision, make_decision
 from modules.utils             import (
     draw_landmarks, draw_motion_regions, draw_person_tracks,
     draw_rbac_result, draw_spoof_badge, stamp_ear, stamp_status,
@@ -64,12 +68,13 @@ st.sidebar.markdown(
 )
 
 _NAV_ITEMS = [
-    ("Home",            ":material/home:"),
-    ("Register User",   ":material/person_add:"),
-    ("Identify: Image", ":material/image_search:"),
-    ("Live Camera",     ":material/videocam:"),
-    ("Admin Panel",     ":material/admin_panel_settings:"),
-    ("Access Log",      ":material/assignment:"),
+    ("Home",              ":material/home:"),
+    ("Security Terminal", ":material/fingerprint:"),
+    ("Register User",     ":material/person_add:"),
+    ("Identify: Image",   ":material/image_search:"),
+    ("Live Camera",       ":material/videocam:"),
+    ("Admin Panel",       ":material/admin_panel_settings:"),
+    ("Access Log",        ":material/assignment:"),
 ]
 
 if "page" not in st.session_state:
@@ -90,8 +95,10 @@ for _pg_name, _pg_icon in _NAV_ITEMS:
 page = st.session_state["page"]
 
 st.sidebar.divider()
-n = user_count()
+n  = user_count()
+bl = blacklist_count()
 st.sidebar.metric("Enrolled users", n)
+st.sidebar.metric("Blacklisted",    bl)
 if n == 0:
     st.sidebar.warning("No users enrolled. Go to Register User first.")
 
@@ -139,12 +146,22 @@ def _run_pipeline(frame_bgr: np.ndarray,
     for loc in face_locs:
         feat_list.append(extract_all(frame_bgr, loc))
 
-    _log("Matching faces against database…")
-    faces = recognize_faces(rgb, security_mode)
+    _log("Checking blacklist + matching faces against database…")
+    faces = recognize_with_blacklist_check(rgb, security_mode)
 
     _log("Anti-spoofing + RBAC decision…")
     pad_lm = all_lm if all_lm else [{}] * len(faces)
     for i, (face, lm) in enumerate(zip(faces, pad_lm)):
+        # ── Blacklist hit: skip anti-spoofing, fire ALERT immediately ─────────
+        if face.get("blacklisted"):
+            decision = make_blacklist_decision(face["blacklist_entry"])
+            spoof    = dict(_SPOOF_FALLBACK)
+            spoofs.append(spoof)
+            decisions.append(decision)
+            draw_rbac_result(result, face, decision)
+            continue
+
+        # ── Authorized-user path ──────────────────────────────────────────────
         feats = feat_list[i] if i < len(feat_list) else None
         gray  = feats["gray_chip"] if feats else None
 
@@ -240,7 +257,7 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
 
     if run_face:
         rgb_s   = cv2.cvtColor(enhanced_s, cv2.COLOR_BGR2RGB)
-        faces_s = recognize_faces(rgb_s, security_mode)
+        faces_s = recognize_with_blacklist_check(rgb_s, security_mode)
 
         faces = [{**f, "top": int(f["top"]*S), "right": int(f["right"]*S),
                   "bottom": int(f["bottom"]*S), "left": int(f["left"]*S)}
@@ -258,6 +275,22 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
 
         pad_lm_s = all_lm_s if all_lm_s else [{}] * len(faces)
         for face, lm_s in zip(faces, pad_lm_s):
+            # ── Blacklist hit: ALERT immediately, skip anti-spoofing ──────────
+            if face.get("blacklisted"):
+                decision = make_blacklist_decision(face["blacklist_entry"])
+                spoof    = dict(_SPOOF_FALLBACK)
+                spoofs.append(spoof)
+                decisions.append(decision)
+                log_access_event(
+                    detected_name=decision.get("name", "Unknown"),
+                    username="", role="blacklisted",
+                    confidence=face.get("blacklist_confidence", 0.0),
+                    action="ALERT", reason=decision.get("reason", ""),
+                    tailgating=False, source="live",
+                )
+                continue
+
+            # ── Authorized-user path ──────────────────────────────────────────
             if lm_s:
                 ear_val, _ = blink_tracker.update(lm_s)
 
@@ -511,6 +544,120 @@ def _live_camera_loop():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TERMINAL PIPELINE  — targeted 1-vs-1 verification for Security Terminal
+# ═══════════════════════════════════════════════════════════════════════════════
+def _run_terminal_pipeline(frame_bgr: np.ndarray,
+                           claimed_username: str,
+                           security_mode: str,
+                           blink_tracker,
+                           cache: dict) -> tuple:
+    """
+    Security Terminal pipeline — blacklist-first, then 1-vs-1 identity check.
+
+    Returns (annotated_frame, decision_or_None, spoof_or_None)
+      decision is non-None only when a definitive outcome is reached:
+        ALLOW  — claimed user verified + liveness confirmed
+        ALERT  — blacklisted face detected (stop immediately)
+      While still scanning (face found but not yet confirmed) returns None.
+    """
+    frame_n    = cache.get("frame_n", 0)
+    run_recog  = frame_n % 2 == 0       # recognition every other frame
+    result     = frame_bgr.copy()
+
+    S     = 1.0 / _PROC_SCALE
+    small = cv2.resize(frame_bgr, (0, 0), fx=_PROC_SCALE, fy=_PROC_SCALE)
+    enhanced_s = apply_clahe(small)
+    rgb_s      = cv2.cvtColor(enhanced_s, cv2.COLOR_BGR2RGB)
+
+    face_locs_s = face_recognition.face_locations(rgb_s, model="hog")
+    if not face_locs_s:
+        cache["frame_n"] = frame_n + 1
+        stamp_status(result, "NO FACE DETECTED", (160, 160, 160))
+        return result, None, None
+
+    face_enc_s = face_recognition.face_encodings(rgb_s, face_locs_s)
+    all_lm_s   = face_recognition.face_landmarks(rgb_s, face_locs_s)
+
+    # Use first detected face only (terminal = single-person flow)
+    enc_s = face_enc_s[0]
+    lm_s  = all_lm_s[0] if all_lm_s else {}
+    loc_s = face_locs_s[0]
+    top_f = int(loc_s[0]*S); right_f = int(loc_s[1]*S)
+    bot_f = int(loc_s[2]*S); left_f  = int(loc_s[3]*S)
+    face_box = {"top": top_f, "right": right_f, "bottom": bot_f, "left": left_f}
+
+    # Landmarks for liveness (full-res coords)
+    lm_full = {k: [(int(x*S), int(y*S)) for x, y in pts] for k, pts in lm_s.items()}
+    if lm_full:
+        blink_tracker.update(lm_s)     # EAR uses small-frame landmarks
+
+    # Face chip for static spoof check
+    roi = frame_bgr[top_f:bot_f, left_f:right_f]
+    gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (64, 64)) if roi.size > 0 else None
+    spoof = static_spoof_check(gray, lm_s) if gray is not None else dict(_SPOOF_FALLBACK)
+    spoof["is_live"] = spoof["is_live"] and blink_tracker.passed
+
+    decision = None
+
+    if run_recog:
+        # ── Step 1: Blacklist check FIRST ─────────────────────────────────────
+        is_bl, bl_entry, bl_conf = check_blacklist(enc_s)
+        if is_bl:
+            decision = make_blacklist_decision(bl_entry)
+            draw_rbac_result(result, face_box, decision)
+            stamp_status(result, "SECURITY ALERT", (0, 0, 220))
+            cache["frame_n"] = frame_n + 1
+            return result, decision, spoof
+
+        # ── Step 2: Verify claimed identity ───────────────────────────────────
+        match, confidence = verify_claimed_user(enc_s, claimed_username, security_mode)
+
+        if match and spoof["is_live"]:
+            decision = make_decision(match, confidence, True, security_mode)
+        elif match and not spoof["is_live"]:
+            decision = make_decision(match, confidence, False, security_mode)
+        else:
+            # Not yet matched — keep scanning, show live feedback
+            pending = {
+                "action": "DENY", "role": "unknown",
+                "color": ROLE_COLORS["unknown"],
+                "label": f"Verifying… ({confidence:.0%})",
+                "reason": "Scanning", "name": "", "username": "",
+            }
+            draw_rbac_result(result, face_box, pending)
+
+        cache["last_match"]      = match
+        cache["last_confidence"] = confidence if match else 0.0
+    else:
+        # Draw last known state between recognition frames
+        last_label = f"Verifying… ({cache.get('last_confidence', 0.0):.0%})"
+        pending = {
+            "action": "DENY", "role": "unknown",
+            "color": ROLE_COLORS["unknown"],
+            "label": last_label,
+            "reason": "Scanning", "name": "", "username": "",
+        }
+        draw_rbac_result(result, face_box, pending)
+
+    # Only a definitive ALLOW or ALERT exits the scan loop
+    if decision and decision["action"] in ("ALLOW", "ALERT"):
+        stamp_status(result,
+                     "ACCESS GRANTED" if decision["action"] == "ALLOW" else "SECURITY ALERT",
+                     (0, 200, 0) if decision["action"] == "ALLOW" else (0, 0, 220))
+        cache["frame_n"] = frame_n + 1
+        return result, decision, spoof
+
+    stamp_ear(result, getattr(blink_tracker, "last_ear", 1.0),
+              blink_tracker.blink_count, blink_tracker.passed)
+    stamp_status(result, "SCANNING…", (0, 140, 255))
+    cache["frame_n"] = frame_n + 1
+    return result, None, spoof
+
+
+from modules.rbac_engine import ROLE_COLORS  # needed by terminal pipeline above
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # HOME
 # ═══════════════════════════════════════════════════════════════════════════════
 if page == "Home":
@@ -555,15 +702,206 @@ modern CV techniques integrated into a single, deployable web application.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECURITY TERMINAL
+# Two-factor flow: credentials (something you know) → face scan (something you are)
+# Blacklist is checked FIRST on every scanned frame.
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "Security Terminal":
+    st.markdown("# :material/fingerprint: Security Terminal")
+    st.caption("Two-factor authentication — credentials verified first, then face scan.")
+
+    if "terminal_state" not in st.session_state:
+        st.session_state["terminal_state"] = "credentials"
+
+    t_state = st.session_state["terminal_state"]
+
+    # ── Step 1: Credentials ───────────────────────────────────────────────────
+    if t_state == "credentials":
+        st.markdown("#### Step 1 of 2 — Enter credentials")
+        col_cred, _ = st.columns([1, 1])
+        with col_cred:
+            with st.form("terminal_login"):
+                t_user = st.text_input("Username", placeholder="your username")
+                t_pass = st.text_input("Password", type="password")
+                submitted = st.form_submit_button(
+                    "Authenticate", type="primary",
+                    icon=":material/lock_open:",
+                    use_container_width=True,
+                )
+
+            if submitted:
+                user_rec = verify_credentials(t_user, t_pass)
+                if user_rec and user_rec["role"] in ("admin", "authorized"):
+                    st.session_state.update({
+                        "terminal_state":        "face_scan",
+                        "terminal_username":     t_user,
+                        "terminal_user_data":    user_rec,
+                        "terminal_sec_mode":     "normal",
+                        "terminal_blink":        BlinkTracker(),
+                        "terminal_frame_n":      0,
+                        "terminal_cache":        {},
+                    })
+                    reset_background_model()
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials or account not authorized.")
+
+        st.info(
+            "Blacklisted individuals attempting to use stolen credentials "
+            "will be flagged at the face-scan step."
+        )
+
+    # ── Step 2: Face scan ─────────────────────────────────────────────────────
+    elif t_state == "face_scan":
+        user_data        = st.session_state.get("terminal_user_data", {})
+        claimed_username = st.session_state.get("terminal_username", "")
+        sec_mode         = st.session_state.get("terminal_sec_mode", "normal")
+        blink_tracker    = st.session_state["terminal_blink"]
+        t_cache          = st.session_state.get("terminal_cache", {})
+
+        st.markdown("#### Step 2 of 2 — Face verification")
+        st.success(
+            f"Credentials accepted for **{user_data.get('name', claimed_username)}**. "
+            "Look directly at the camera and blink once to confirm liveness."
+        )
+
+        col_ctrl, _ = st.columns([2, 3])
+        with col_ctrl:
+            sec_mode = st.select_slider(
+                "Security mode", SECURITY_OPTIONS, value=sec_mode,
+                key="terminal_sec_slider",
+            )
+            st.session_state["terminal_sec_mode"] = sec_mode
+            if st.button("Cancel", icon=":material/cancel:", use_container_width=True):
+                cap_ref = st.session_state.pop("terminal_cap", None)
+                if cap_ref:
+                    cap_ref.release()
+                st.session_state["terminal_state"] = "credentials"
+                st.rerun()
+
+        st.divider()
+
+        # Open webcam once and keep it in session_state
+        if "terminal_cap" not in st.session_state:
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            if not cap.isOpened():
+                st.error("Cannot open webcam.")
+                st.session_state["terminal_state"] = "credentials"
+                st.stop()
+            st.session_state["terminal_cap"] = cap
+
+        cap = st.session_state["terminal_cap"]
+        cap.grab(); cap.grab()
+        ret, frame = cap.read()
+
+        if ret:
+            annotated, decision, spoof = _run_terminal_pipeline(
+                frame, claimed_username, sec_mode, blink_tracker, t_cache
+            )
+            st.session_state["terminal_cache"] = t_cache
+
+            col_feed, col_panel = st.columns([3, 2])
+            with col_feed:
+                st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                         use_container_width=True)
+            with col_panel:
+                if blink_tracker.passed:
+                    st.success(":material/visibility: Liveness confirmed")
+                else:
+                    st.info(f":material/visibility: Blinks detected: {blink_tracker.blink_count} — blink once")
+
+                if spoof and not spoof.get("is_live", True):
+                    st.error(":material/block: Anti-spoofing check failed")
+
+            if decision and decision["action"] in ("ALLOW", "ALERT"):
+                # Definitive outcome — stop scanning, log event, transition
+                log_access_event(
+                    detected_name=decision.get("name", user_data.get("name", "")),
+                    username=claimed_username,
+                    role=decision.get("role", "unknown"),
+                    confidence=t_cache.get("last_confidence", 0.0),
+                    action=decision["action"],
+                    reason=decision.get("reason", ""),
+                    tailgating=False,
+                    source="terminal",
+                )
+                cap.release()
+                st.session_state.pop("terminal_cap", None)
+                st.session_state["terminal_state"]  = "result"
+                st.session_state["terminal_result"] = decision
+                st.rerun()
+
+        st.session_state["terminal_frame_n"] = st.session_state.get("terminal_frame_n", 0) + 1
+        time.sleep(0.05)
+        st.rerun()
+
+    # ── Step 3: Result ────────────────────────────────────────────────────────
+    elif t_state == "result":
+        decision  = st.session_state.get("terminal_result", {})
+        action    = decision.get("action", "DENY")
+        user_data = st.session_state.get("terminal_user_data", {})
+
+        st.markdown("#### Authentication Result")
+
+        if action == "ALLOW":
+            st.markdown(
+                "<div style='background:#0d2b0d;padding:30px;border-radius:12px;"
+                "text-align:center;border:2px solid #00bb00'>"
+                "<p style='font-size:3rem;color:#00dd00;margin:0'>✓ ACCESS GRANTED</p>"
+                f"<h3 style='color:#00dd00;margin:10px 0'>{decision.get('label','')}</h3>"
+                f"<p style='color:#99ee99;margin:0'>{decision.get('reason','')}</p>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        elif action == "ALERT":
+            st.markdown(
+                "<div style='background:#2b0000;padding:30px;border-radius:12px;"
+                "text-align:center;border:3px solid #cc0000'>"
+                "<p style='font-size:3rem;color:#ff2222;margin:0'>⚠ SECURITY ALERT</p>"
+                f"<h3 style='color:#ff2222;margin:10px 0'>{decision.get('label','')}</h3>"
+                f"<p style='color:#ffaaaa;margin:0'>{decision.get('reason','')}</p>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div style='background:#2b0d0d;padding:30px;border-radius:12px;"
+                "text-align:center;border:2px solid #cc0000'>"
+                "<p style='font-size:3rem;color:#ee2222;margin:0'>✗ ACCESS DENIED</p>"
+                f"<h3 style='color:#ee2222;margin:10px 0'>{decision.get('label','')}</h3>"
+                f"<p style='color:#ffaaaa;margin:0'>{decision.get('reason','')}</p>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+        if st.button("New Session", icon=":material/refresh:", type="primary"):
+            for k in ("terminal_state", "terminal_username", "terminal_user_data",
+                      "terminal_blink", "terminal_cache", "terminal_result",
+                      "terminal_frame_n", "terminal_sec_mode"):
+                st.session_state.pop(k, None)
+            cap_ref = st.session_state.pop("terminal_cap", None)
+            if cap_ref:
+                cap_ref.release()
+            st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # REGISTER USER
 # ═══════════════════════════════════════════════════════════════════════════════
 elif page == "Register User":
     st.markdown("# :material/person_add: Register User")
 
-    tab_manual, tab_bulk = st.tabs(["Manual Enrollment", "Bulk Import — Pins Dataset"])
+    tab_manual, tab_blacklist, tab_bulk = st.tabs(
+        ["Enroll Authorized User", "Blacklist Entry", "Bulk Import — Pins Dataset"]
+    )
 
+    # ── Tab 1: Enroll authorized / admin user ─────────────────────────────────
     with tab_manual:
-        st.subheader("Create a new user account")
+        st.subheader("Create a new authorized user account")
         col_form, col_info = st.columns([3, 2], gap="large")
 
         with col_form:
@@ -571,7 +909,7 @@ elif page == "Register User":
             username  = st.text_input("Username",   placeholder="e.g. alice")
             password  = st.text_input("Password",   type="password",
                                       placeholder="Min 8 chars, upper, lower, special")
-            role      = st.selectbox("Role", ["authorized", "admin", "blacklisted"])
+            role      = st.selectbox("Role", ["authorized", "admin"])
             photos    = st.file_uploader(
                 "Face photos (3–5 recommended)",
                 type=["jpg", "jpeg", "png"],
@@ -672,12 +1010,95 @@ elif page == "Register User":
 |---|---|
 | `authorized` | Standard access — green box |
 | `admin` | Full access — gold box |
-| `blacklisted` | Denied + security alert |
 
 **Tips for good enrolment**
 - Use 3–5 photos with varied lighting
 - Face clearly visible and front-facing
 - Avoid sunglasses or heavy obstructions
+
+> Threat individuals are enrolled separately
+> via the **Blacklist Entry** tab — they do not
+> get a username or system credentials.
+            """)
+
+    # ── Tab 2: Blacklist entry (no credentials required) ─────────────────────
+    with tab_blacklist:
+        st.subheader("Add a threat individual to the blacklist")
+        st.caption(
+            "Blacklisted identities are stored separately from authorized users. "
+            "They have no system credentials and cannot authenticate. "
+            "Their face encodings are checked first in every pipeline."
+        )
+
+        col_bl, col_bl_info = st.columns([3, 2], gap="large")
+        with col_bl:
+            bl_name   = st.text_input("Name / Label",
+                                      placeholder="e.g. John Doe or Unknown Male #1")
+            bl_reason = st.selectbox("Threat reason",
+                                     ["Trespassing", "Banned employee",
+                                      "Flagged intruder", "Court order",
+                                      "Other security threat"])
+            bl_notes  = st.text_area("Additional notes (optional)",
+                                     placeholder="e.g. Attempted break-in on 2026-01-15")
+            bl_photos = st.file_uploader(
+                "Face photos (3–5 recommended)",
+                type=["jpg", "jpeg", "png"],
+                accept_multiple_files=True,
+                key="bl_photos",
+            )
+
+            bl_ready = bool(bl_name and bl_reason and bl_photos)
+            if st.button("Add to Blacklist", type="primary",
+                         icon=":material/block:", disabled=not bl_ready):
+                with st.status("Processing blacklist entry…", expanded=True) as bl_status:
+                    bl_prog = st.progress(0.0)
+
+                    import tempfile
+                    saved_bl_paths = []
+                    with tempfile.TemporaryDirectory() as tmp_dir:
+                        for uf in bl_photos:
+                            dst = os.path.join(tmp_dir, uf.name)
+                            with open(dst, "wb") as f:
+                                f.write(uf.read())
+                            saved_bl_paths.append(dst)
+                        bl_prog.progress(0.30)
+                        st.write(f"Saved {len(saved_bl_paths)} image(s) temporarily")
+
+                        st.write("Detecting and encoding face…")
+                        bl_enc = extract_average_encoding(saved_bl_paths)
+                        bl_prog.progress(0.70)
+
+                    if bl_enc is None:
+                        st.error("No faces detected. Use clearer, front-facing photos.")
+                        bl_status.update(label="Failed — no face detected", state="error")
+                        st.stop()
+
+                    st.write("Storing in blacklist database…")
+                    bl_ok, bl_msg = create_blacklist_entry(
+                        bl_name, bl_reason, bl_notes, bl_enc
+                    )
+                    bl_prog.progress(1.0)
+
+                    if bl_ok:
+                        bl_status.update(label="Blacklist entry added!", state="complete")
+                        st.success(bl_msg)
+                    else:
+                        bl_status.update(label="Failed", state="error")
+                        st.error(bl_msg)
+
+        with col_bl_info:
+            st.markdown("""
+**Who belongs here?**
+- Trespassers or intruders caught on camera
+- Former employees banned from premises
+- Individuals with court-issued restrictions
+- Any flagged security threat
+
+**How it works**
+1. Face encoding stored in the `blacklist` table
+2. Every pipeline checks blacklist **first**
+3. On match: immediate **ALERT** — no further processing
+4. Blacklisted persons cannot authenticate via the Security Terminal
             """)
 
     with tab_bulk:
@@ -709,7 +1130,7 @@ elif page == "Register User":
                 with col_b:
                     max_imgs    = st.slider("Images / person", 3, 15, 5)
                     bulk_role   = st.selectbox("Assign role",
-                                               ["authorized", "admin", "blacklisted"],
+                                               ["authorized", "admin"],
                                                key="bulk_role")
                     auto_enroll = st.checkbox("Auto-extract encodings", value=True)
 
@@ -814,13 +1235,6 @@ elif page == "Identify: Image":
                 else:
                     st.error(f"DENY — {decision['label']} — {decision['reason']}")
 
-                with st.expander("Anti-spoofing details"):
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Texture variance", f"{spoof['texture_variance']:.5f}",
-                              delta="Real" if spoof["texture_ok"] else "Suspicious")
-                    c2.metric("Laplacian score",  f"{spoof['laplacian_score']:.1f}",
-                              delta="Sharp" if spoof["laplacian_ok"] else "Flat/blurry")
-                    c3.metric("Overall liveness", "LIVE" if spoof["is_live"] else "SPOOF?")
 
         # ── KNN Secondary Verification ─────────────────────────────────────────
         if feat_list and any(f is not None for f in feat_list):
@@ -975,9 +1389,8 @@ elif page == "Admin Panel":
         st.info("No users enrolled yet.")
     else:
         ROLE_BADGE = {
-            "admin":       ":material/shield: Admin",
-            "authorized":  ":material/check_circle: Authorized",
-            "blacklisted": ":material/block: Blacklisted",
+            "admin":      ":material/shield: Admin",
+            "authorized": ":material/check_circle: Authorized",
         }
         for u in users:
             col_name, col_role, col_change, col_del = st.columns(
@@ -991,8 +1404,9 @@ elif page == "Admin Panel":
             col_role.markdown(ROLE_BADGE.get(u["role"], u["role"]))
 
             new_role = col_change.selectbox(
-                "Role", ["authorized", "admin", "blacklisted"],
-                index=["authorized", "admin", "blacklisted"].index(u["role"]),
+                "Role", ["authorized", "admin"],
+                index=["authorized", "admin"].index(u["role"])
+                      if u["role"] in ("authorized", "admin") else 0,
                 key=f"role_{u['username']}",
                 label_visibility="collapsed",
             )
@@ -1009,6 +1423,37 @@ elif page == "Admin Panel":
                 folder = os.path.join(KNOWN_FACES_DIR, u["username"])
                 if os.path.isdir(folder):
                     shutil.rmtree(folder, ignore_errors=True)
+                st.rerun()
+
+    st.divider()
+
+    # ── Blacklist management ──────────────────────────────────────────────────
+    st.subheader(":material/block: Blacklist Management")
+    bl_entries = get_all_blacklist_entries()
+    st.caption(
+        f"{len(bl_entries)} blacklisted individual(s) — "
+        "their face encodings are checked first in every pipeline."
+    )
+
+    if not bl_entries:
+        st.info("No blacklist entries. Add threat individuals via Register User → Blacklist Entry.")
+    else:
+        for entry in bl_entries:
+            bc1, bc2, bc3, bc4 = st.columns([3, 3, 2, 1.5], vertical_alignment="center")
+            bc1.markdown(
+                f"**{entry['name']}**  \n"
+                f"<small style='color:gray'>{entry['created_at']}</small>",
+                unsafe_allow_html=True,
+            )
+            bc2.markdown(
+                f":material/warning: `{entry['threat_reason']}`  \n"
+                f"<small style='color:gray'>{entry.get('notes','') or '—'}</small>",
+                unsafe_allow_html=True,
+            )
+            bc3.markdown(":material/block: **BLACKLISTED**")
+            if bc4.button("Remove", key=f"bl_del_{entry['id']}",
+                          icon=":material/delete:", use_container_width=True):
+                delete_blacklist_entry(entry["id"])
                 st.rerun()
 
 
