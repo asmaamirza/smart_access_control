@@ -18,8 +18,8 @@ from modules.background_model import apply_clahe, detect_motion, reset_backgroun
 from modules.database         import (
     blacklist_count, clear_access_log, create_blacklist_entry, create_user,
     delete_blacklist_entry, delete_user, get_access_log, get_all_blacklist_entries,
-    get_all_users, get_log_stats, init_db, log_access_event, update_role,
-    update_face_encoding, user_count, verify_credentials,
+    get_all_users, get_log_stats, init_db, log_access_event, update_password,
+    update_role, update_face_encoding, user_count, verify_credentials,
 )
 from modules.face_recognizer  import (
     check_blacklist, extract_average_encoding, recognize_with_blacklist_check,
@@ -35,7 +35,7 @@ from modules.utils             import (
 )
 
 KNOWN_FACES_DIR  = "known_faces"
-SECURITY_OPTIONS = ["normal", "strict", "relaxed"]
+SECURITY_OPTIONS = ["normal", "relaxed"]
 
 _SPOOF_FALLBACK = {
     "is_live": True, "texture_ok": True, "laplacian_ok": True,
@@ -102,6 +102,70 @@ st.sidebar.metric("Blacklisted",    bl)
 if n == 0:
     st.sidebar.warning("No users enrolled. Go to Register User first.")
 
+st.sidebar.divider()
+st.sidebar.markdown("**System health**")
+_dot = lambda ok, label: st.sidebar.markdown(
+    f"<span style='color:{'#22cc44' if ok else '#cc2222'};font-size:1.1rem'>●</span> {label}",
+    unsafe_allow_html=True,
+)
+try:
+    user_count(); _db_ok = True
+except Exception:
+    _db_ok = False
+_dot(_db_ok, "Database")
+_dot(knn_is_ready(), f"KNN model {'ready' if knn_is_ready() else 'not trained'}")
+_cam_live = st.session_state.get("cam_running", False)
+_dot(_cam_live, f"Camera {'active' if _cam_live else 'idle'}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHARED CORE — anti-spoofing + RBAC decisions for a list of detected faces
+# Used by both image pipeline and live pipeline to eliminate duplication.
+# ═══════════════════════════════════════════════════════════════════════════════
+def _decide_faces(faces: list, lm_list: list, frame_bgr: np.ndarray,
+                  security_mode: str,
+                  blink_tracker=None,
+                  feat_list: list | None = None) -> tuple[list, list]:
+    """
+    Run anti-spoofing + RBAC for every detected face.
+    Returns (decisions, spoofs) — one entry per face, in the same order.
+    Does NOT draw or log; callers handle that differently.
+
+    blink_tracker: if supplied (live mode), EAR is tracked and liveness gate applied.
+    feat_list:     if supplied (image mode), pre-extracted gray chips are preferred.
+    """
+    decisions: list = []
+    spoofs:    list = []
+
+    for i, (face, lm) in enumerate(zip(faces, lm_list)):
+        if face.get("blacklisted"):
+            decisions.append(make_blacklist_decision(face["blacklist_entry"]))
+            spoofs.append(dict(_SPOOF_FALLBACK))
+            continue
+
+        # Update blink tracker before spoof check so .passed reflects this frame
+        if blink_tracker is not None and lm:
+            blink_tracker.update(lm)
+
+        # Prefer pre-extracted aligned chip; fall back to cropping the full frame
+        gray = None
+        if feat_list and i < len(feat_list) and feat_list[i]:
+            gray = feat_list[i].get("gray_chip")
+        if gray is None:
+            roi = frame_bgr[face["top"]:face["bottom"], face["left"]:face["right"]]
+            if roi.size > 0:
+                gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (64, 64))
+
+        spoof = static_spoof_check(gray, lm) if gray is not None else dict(_SPOOF_FALLBACK)
+        if blink_tracker is not None:
+            spoof["is_live"] = spoof["is_live"] and blink_tracker.passed
+        spoofs.append(spoof)
+
+        decisions.append(make_decision(face["match"], face["confidence"],
+                                       spoof["is_live"], security_mode))
+
+    return decisions, spoofs
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PIPELINE — full identification on one BGR frame  (image mode)
@@ -151,37 +215,14 @@ def _run_pipeline(frame_bgr: np.ndarray,
 
     _log("Anti-spoofing + RBAC decision…")
     pad_lm = all_lm if all_lm else [{}] * len(faces)
-    for i, (face, lm) in enumerate(zip(faces, pad_lm)):
-        # ── Blacklist hit: skip anti-spoofing, fire ALERT immediately ─────────
-        if face.get("blacklisted"):
-            decision = make_blacklist_decision(face["blacklist_entry"])
-            spoof    = dict(_SPOOF_FALLBACK)
-            spoofs.append(spoof)
-            decisions.append(decision)
-            draw_rbac_result(result, face, decision)
-            continue
-
-        # ── Authorized-user path ──────────────────────────────────────────────
-        feats = feat_list[i] if i < len(feat_list) else None
-        gray  = feats["gray_chip"] if feats else None
-
-        if gray is None:
-            top, right, bottom, left = face["top"], face["right"], face["bottom"], face["left"]
-            roi = frame_bgr[top:bottom, left:right]
-            if roi.size > 0:
-                gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (64, 64))
-
-        spoof = static_spoof_check(gray, lm) if gray is not None else dict(_SPOOF_FALLBACK)
-        spoofs.append(spoof)
-
-        decision = make_decision(face["match"], face["confidence"],
-                                 spoof["is_live"], security_mode)
-        decisions.append(decision)
-
+    decisions, spoofs = _decide_faces(faces, pad_lm, frame_bgr, security_mode,
+                                      feat_list=feat_list)
+    for face, decision, spoof, lm in zip(faces, decisions, spoofs, pad_lm):
         draw_rbac_result(result, face, decision)
-        draw_spoof_badge(result, face, spoof)
-        if show_landmarks and lm:
-            draw_landmarks(result, lm)
+        if not face.get("blacklisted"):
+            draw_spoof_badge(result, face, spoof)
+            if show_landmarks and lm:
+                draw_landmarks(result, lm)
 
     _log("Tracking persons (YOLOv8 + ByteTrack)…")
     persons, tailgating = detect_and_track(result)
@@ -269,18 +310,12 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
         all_lm = [{k: [(int(x*S), int(y*S)) for x, y in pts]
                    for k, pts in lm.items()} for lm in all_lm_s]
 
-        ear_val   = 1.0
-        decisions = []
-        spoofs    = []
-
         pad_lm_s = all_lm_s if all_lm_s else [{}] * len(faces)
-        for face, lm_s in zip(faces, pad_lm_s):
-            # ── Blacklist hit: ALERT immediately, skip anti-spoofing ──────────
+        decisions, spoofs = _decide_faces(faces, pad_lm_s, frame_bgr, security_mode,
+                                          blink_tracker=blink_tracker)
+
+        for face, decision in zip(faces, decisions):
             if face.get("blacklisted"):
-                decision = make_blacklist_decision(face["blacklist_entry"])
-                spoof    = dict(_SPOOF_FALLBACK)
-                spoofs.append(spoof)
-                decisions.append(decision)
                 log_access_event(
                     detected_name=decision.get("name", "Unknown"),
                     username="", role="blacklisted",
@@ -288,42 +323,22 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
                     action="ALERT", reason=decision.get("reason", ""),
                     tailgating=False, source="live",
                 )
-                continue
-
-            # ── Authorized-user path ──────────────────────────────────────────
-            if lm_s:
-                ear_val, _ = blink_tracker.update(lm_s)
-
-            gray = None
-            top, right, bottom, left = face["top"], face["right"], face["bottom"], face["left"]
-            roi = frame_bgr[top:bottom, left:right]
-            if roi.size > 0:
-                gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (64, 64))
-
-            spoof = static_spoof_check(gray, lm_s) if gray is not None else dict(_SPOOF_FALLBACK)
-            spoof["is_live"] = spoof["is_live"] and blink_tracker.passed
-            spoofs.append(spoof)
-
-            decision = make_decision(face["match"], face["confidence"],
-                                     spoof["is_live"], security_mode)
-            decisions.append(decision)
-
-            log_access_event(
-                detected_name=decision.get("name", "Unknown"),
-                username=decision.get("username", ""),
-                role=decision.get("role", "unknown"),
-                confidence=face["confidence"],
-                action=decision["action"],
-                reason=decision.get("reason", ""),
-                tailgating=False,
-                source="live",
-            )
+            else:
+                log_access_event(
+                    detected_name=decision.get("name", "Unknown"),
+                    username=decision.get("username", ""),
+                    role=decision.get("role", "unknown"),
+                    confidence=face["confidence"],
+                    action=decision["action"],
+                    reason=decision.get("reason", ""),
+                    tailgating=False, source="live",
+                )
 
         cache["faces"]     = faces
         cache["decisions"] = decisions
         cache["spoofs"]    = spoofs
         cache["all_lm"]    = all_lm
-        cache["ear"]       = ear_val
+        cache["ear"]       = blink_tracker.last_ear
 
         stage_log += [("Face recognition", True), ("Anti-spoofing", True), ("RBAC decision", True)]
     else:
@@ -451,6 +466,18 @@ def _live_camera_loop():
 
     result, faces, decisions, spoofs, _, tailgating, stage_log = \
         _run_pipeline_live(frame, sec_mode, show_lm, tracker, live_cache)
+
+    # ── ALERT flash — full-page red pulse when a blacklisted face is detected ──
+    if any(d["action"] == "ALERT" for d in decisions):
+        st.markdown(
+            "<style>@keyframes alert-flash{"
+            "0%,100%{background:rgba(200,0,0,0.28)}50%{background:rgba(200,0,0,0.04)}}"
+            "</style>"
+            "<div style='position:fixed;top:0;left:0;width:100vw;height:100vh;"
+            "pointer-events:none;z-index:9999;"
+            "animation:alert-flash 0.45s ease-in-out infinite'></div>",
+            unsafe_allow_html=True,
+        )
 
     # ── FPS calculation (rolling average over last 10 frames) ─────────────────
     elapsed = time.time() - t_frame_start
@@ -679,7 +706,7 @@ modern CV techniques integrated into a single, deployable web application.
 | Classical Features | Canny · LBP · HOG | Structural & texture descriptors |
 | Face Recognition | 128-d ResNet embedding (dlib) | Identity matching |
 | Anti-Spoofing | EAR blink · LBP variance · Laplacian | Liveness verification |
-| Person Tracking | YOLOv8n + ByteTrack | Multi-person, tailgating detection |
+| Person Tracking | YOLOv8n detection | Multi-person, tailgating detection |
 | RBAC Decision | Role-based engine | Allow / Deny / Alert |
 
 ---
@@ -895,6 +922,14 @@ elif page == "Security Terminal":
 elif page == "Register User":
     st.markdown("# :material/person_add: Register User")
 
+    if "reg_n" not in st.session_state:
+        st.session_state.reg_n = 0
+    n = st.session_state.reg_n
+
+    if st.button("Clear everything", icon=":material/refresh:", type="secondary"):
+        st.session_state.reg_n += 1
+        st.rerun()
+
     tab_manual, tab_blacklist, tab_bulk = st.tabs(
         ["Enroll Authorized User", "Blacklist Entry", "Bulk Import — Pins Dataset"]
     )
@@ -905,16 +940,43 @@ elif page == "Register User":
         col_form, col_info = st.columns([3, 2], gap="large")
 
         with col_form:
-            name      = st.text_input("Full name",  placeholder="e.g. Alice Smith")
-            username  = st.text_input("Username",   placeholder="e.g. alice")
+            name      = st.text_input("Full name",  placeholder="e.g. Alice Smith",  key=f"reg_name_{n}")
+            username  = st.text_input("Username",   placeholder="e.g. alice",          key=f"reg_uname_{n}")
             password  = st.text_input("Password",   type="password",
-                                      placeholder="Min 8 chars, upper, lower, special")
-            role      = st.selectbox("Role", ["authorized", "admin"])
+                                      placeholder="Min 8 chars, upper, lower, special", key=f"reg_pw_{n}")
+            role      = st.selectbox("Role", ["authorized", "admin"],                  key=f"reg_role_{n}")
             photos    = st.file_uploader(
                 "Face photos (3–5 recommended)",
                 type=["jpg", "jpeg", "png"],
                 accept_multiple_files=True,
+                key=f"reg_photos_{n}",
             )
+
+            # ── Photo preview with face detection ─────────────────────────────
+            if photos:
+                st.markdown("**Preview — face detection per photo:**")
+                prev_cols = st.columns(min(len(photos), 5))
+                any_missing = False
+                for _pi, _uf in enumerate(photos[:5]):
+                    _raw  = np.frombuffer(_uf.read(), np.uint8)
+                    _uf.seek(0)
+                    _bgr  = cv2.imdecode(_raw, cv2.IMREAD_COLOR)
+                    if _bgr is None:
+                        continue
+                    _rgb  = cv2.cvtColor(_bgr, cv2.COLOR_BGR2RGB)
+                    _locs = face_recognition.face_locations(_rgb, model="hog")
+                    _prev = _bgr.copy()
+                    for (_t, _r, _b, _l) in _locs:
+                        cv2.rectangle(_prev, (_l, _t), (_r, _b), (0, 200, 0), 2)
+                    if not _locs:
+                        any_missing = True
+                    prev_cols[_pi].image(
+                        cv2.cvtColor(_prev, cv2.COLOR_BGR2RGB),
+                        caption=f"{'Face OK' if _locs else 'No face!'} ({len(_locs)})",
+                        use_container_width=True,
+                    )
+                if any_missing:
+                    st.warning("Some photos have no detected face — they will be skipped.")
 
             # ── Password strength check ───────────────────────────────────────
             pw_errors = []
@@ -1033,18 +1095,21 @@ elif page == "Register User":
         col_bl, col_bl_info = st.columns([3, 2], gap="large")
         with col_bl:
             bl_name   = st.text_input("Name / Label",
-                                      placeholder="e.g. John Doe or Unknown Male #1")
+                                      placeholder="e.g. John Doe or Unknown Male #1",
+                                      key=f"bl_name_{n}")
             bl_reason = st.selectbox("Threat reason",
                                      ["Trespassing", "Banned employee",
                                       "Flagged intruder", "Court order",
-                                      "Other security threat"])
+                                      "Other security threat"],
+                                     key=f"bl_reason_{n}")
             bl_notes  = st.text_area("Additional notes (optional)",
-                                     placeholder="e.g. Attempted break-in on 2026-01-15")
+                                     placeholder="e.g. Attempted break-in on 2026-01-15",
+                                     key=f"bl_notes_{n}")
             bl_photos = st.file_uploader(
                 "Face photos (3–5 recommended)",
                 type=["jpg", "jpeg", "png"],
                 accept_multiple_files=True,
-                key="bl_photos",
+                key=f"bl_photos_{n}",
             )
 
             bl_ready = bool(bl_name and bl_reason and bl_photos)
@@ -1109,7 +1174,7 @@ elif page == "Register User":
         dataset_path = st.text_input(
             "Dataset root folder",
             placeholder=r"C:\Users\Dell\smart_access_control\archive\105_classes_pins_dataset",
-            key="bulk_path",
+            key=f"bulk_path_{n}",
         )
 
         if dataset_path and os.path.isdir(dataset_path):
@@ -1455,6 +1520,42 @@ elif page == "Admin Panel":
                           icon=":material/delete:", use_container_width=True):
                 delete_blacklist_entry(entry["id"])
                 st.rerun()
+
+    st.divider()
+
+    # ── Password change ───────────────────────────────────────────────────────
+    st.subheader(":material/key: Change Password")
+    if not users:
+        st.info("No users enrolled yet.")
+    else:
+        with st.form("change_pw_form"):
+            pw_col1, pw_col2 = st.columns([2, 3])
+            pw_uname   = pw_col1.selectbox("User", [u["username"] for u in users],
+                                           format_func=lambda u: f"{u}  ({next((x['name'] for x in users if x['username']==u), '')})")
+            new_pw     = pw_col2.text_input("New password", type="password",
+                                            placeholder="Min 8 chars, upper, lower, special")
+            confirm_pw = pw_col2.text_input("Confirm password", type="password")
+            pw_submit  = st.form_submit_button("Update password",
+                                               type="primary",
+                                               icon=":material/lock_reset:")
+
+        if pw_submit:
+            _pw_errors = []
+            if len(new_pw) < 8:
+                _pw_errors.append("at least 8 characters")
+            if not any(c.islower() for c in new_pw):
+                _pw_errors.append("a lowercase letter")
+            if not any(c.isupper() for c in new_pw):
+                _pw_errors.append("an uppercase letter")
+            if not any(c in "!@#$%^&*()_+-=[]{}|;':\",./<>?" for c in new_pw):
+                _pw_errors.append("a special character")
+            if new_pw != confirm_pw:
+                st.error("Passwords do not match.")
+            elif _pw_errors:
+                st.error("Password must contain: " + ", ".join(_pw_errors))
+            else:
+                update_password(pw_uname, new_pw)
+                st.success(f"Password updated for `{pw_uname}`.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

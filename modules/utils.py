@@ -96,9 +96,9 @@ def draw_spoof_badge(frame_bgr: np.ndarray, face: dict, spoof: dict) -> None:
 def draw_person_tracks(frame_bgr: np.ndarray,
                        persons: list[dict], tailgating: bool) -> None:
     color = RED if tailgating else ORANGE
-    for p in persons:
+    for i, p in enumerate(persons, 1):
         cv2.rectangle(frame_bgr, (p["x1"], p["y1"]), (p["x2"], p["y2"]), color, 2)
-        cv2.putText(frame_bgr, f"ID {p['track_id']}",
+        cv2.putText(frame_bgr, f"Person {i}",
                     (p["x1"], p["y1"] - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
 

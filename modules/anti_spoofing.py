@@ -70,9 +70,11 @@ class BlinkTracker:
     def __init__(self):
         self.blink_count   = 0
         self._was_blinking = False
+        self.last_ear      = 1.0
 
     def update(self, landmarks: dict) -> tuple[float, bool]:
         ear, blinking = compute_ear(landmarks)
+        self.last_ear = ear
         # Rising edge: was blinking last frame, not blinking this frame → completed blink
         if self._was_blinking and not blinking:
             self.blink_count += 1

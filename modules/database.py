@@ -159,6 +159,19 @@ def delete_user(username: str) -> None:
     conn.close()
 
 
+def update_password(username: str, new_password: str) -> None:
+    """Re-hash and store a new password for an existing user."""
+    salt    = secrets.token_hex(16)
+    pw_hash = _hash_password(new_password, salt)
+    conn = _connect()
+    conn.execute(
+        "UPDATE users SET password_hash=?, salt=? WHERE username=?",
+        (pw_hash, salt, username),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_all_face_encodings() -> list[dict]:
     """Return [{username, name, role, encoding}] for every user with a stored encoding."""
     conn = _connect()

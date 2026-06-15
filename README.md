@@ -18,7 +18,7 @@ A deployable Streamlit web application that implements enterprise-grade physical
 | 6 | Face detection / recognition | HOG+SVM detector + ResNet identity matching |
 | 7 | Video processing | Frame-by-frame webcam loop with `@st.fragment`; motion-gated recognition |
 | 8 | Change detection & background modelling | MOG2 Gaussian Mixture Model foreground/background separation |
-| 9 | Object tracking | ByteTrack multi-person tracker with persistent track IDs; tailgating detection |
+| 9 | Object tracking | YOLOv8n person detection; tailgating flagged when `len(detections) > 1` |
 | 10 | Binary morphological operations | Dilate + erode on MOG2 foreground mask to remove noise |
 
 ---
@@ -195,7 +195,7 @@ smart_access_control/
 | dlib ResNet-34 | Pre-trained | `face_recognition_models` | 128-d face embedding (LFW 99.38%) |
 | dlib shape predictor | Pre-trained | `face_recognition_models` | 68 facial landmark keypoints |
 | KNN Classifier | **Trained on custom data** | scikit-learn, trained at runtime | Secondary identity verification (Canny+LBP+HOG features) |
-| YOLOv8n | Pre-trained (COCO) | Ultralytics | Person detection for tailgating |
+| YOLOv8n | Pre-trained (COCO) | Ultralytics | Person detection; tailgating = `len > 1` |
 | MOG2 | Statistical model | OpenCV | Background subtraction, motion gating |
 
 The **KNN classifier** is the project's custom-trained model: it is fitted from scratch on Canny+LBP+HOG feature vectors extracted from each enrolled user's face images. It retrains automatically on every new enrolment.
