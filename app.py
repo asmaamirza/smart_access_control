@@ -3,6 +3,7 @@ Smart Access Control System — CSCI435 Project
 Entry point: streamlit run app.py
 """
 
+import logging
 import os
 import shutil
 import secrets
@@ -13,7 +14,10 @@ import face_recognition
 import numpy as np
 import streamlit as st
 
-from modules.anti_spoofing    import BlinkTracker, static_spoof_check
+from modules.anti_spoofing    import (
+    BlinkTracker, static_spoof_check,
+    temporal_spoof_check, replay_artifact_check, aggregate_spoof_result,
+)
 from modules.background_model import apply_clahe, detect_motion, reset_background_model
 from modules.database         import (
     blacklist_count, clear_access_log, create_blacklist_entry, create_user,
@@ -28,26 +32,52 @@ from modules.face_recognizer  import (
 from modules.feature_extractor import extract_all
 from modules.knn_engine        import knn_info, knn_is_ready, predict_knn, train_knn
 from modules.person_tracker    import detect_and_track, reset_tracker
-from modules.rbac_engine       import make_blacklist_decision, make_decision
+from modules.rbac_engine       import make_blacklist_decision, make_decision, ROLE_COLORS
 from modules.utils             import (
     draw_landmarks, draw_motion_regions, draw_person_tracks,
     draw_rbac_result, draw_spoof_badge, stamp_ear, stamp_status,
 )
 
-KNOWN_FACES_DIR  = "known_faces"
-SECURITY_OPTIONS = ["normal", "relaxed"]
+KNOWN_FACES_DIR = "known_faces"
+
+# ── Stability / stillness gate constants ──────────────────────────────────────
+STABILITY_MOVEMENT_THRESHOLD = 12    # max center-pixel displacement between frames
+STABILITY_REQUIRED_FRAMES    = 3     # consecutive stable frames before proceeding
+STABILITY_SCALE_THRESHOLD    = 0.15  # max fractional change in face box height
+
+# ── Test sample directories ───────────────────────────────────────────────────
+TEST_DIR          = "test"
+TEST_IMAGE_DIR    = os.path.join(TEST_DIR, "image_detection")
+TEST_LIVE_DIR     = os.path.join(TEST_DIR, "live_camera")
+TEST_SPOOF_DIR    = os.path.join(TEST_DIR, "spoof_samples")
+TEST_TAILGATE_DIR = os.path.join(TEST_DIR, "tailgating_samples")
+
+# ── Structured logging ────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.WARNING,
+                    format="%(levelname)s | SmartAccess | %(message)s")
+_LOG = logging.getLogger("SmartAccess")
+
+
+def _log_info(msg: str):    _LOG.info(msg)
+def _log_warning(msg: str): _LOG.warning(msg)
+def _log_error(msg: str):   _LOG.error(msg)
+
 
 _SPOOF_FALLBACK = {
     "is_live": True, "texture_ok": True, "laplacian_ok": True,
     "texture_variance": 0.0, "laplacian_score": 0.0, "ear": None,
+    "status": "LIVE",
 }
 
 # Run live detection on a downsampled copy — 4x fewer pixels => ~4x faster HOG
-_PROC_SCALE = 0.5
+_PROC_SCALE  = 0.5
+_CLAHE_EVERY = 4   # reuse enhanced frame for this many frames before recomputing
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 init_db()
 os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+for _d in (TEST_IMAGE_DIR, TEST_LIVE_DIR, TEST_SPOOF_DIR, TEST_TAILGATE_DIR):
+    os.makedirs(_d, exist_ok=True)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -116,6 +146,36 @@ _dot(_db_ok, "Database")
 _dot(knn_is_ready(), f"KNN model {'ready' if knn_is_ready() else 'not trained'}")
 _cam_live = st.session_state.get("cam_running", False)
 _dot(_cam_live, f"Camera {'active' if _cam_live else 'idle'}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STABILITY / STILLNESS GATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compute_face_stability(
+    prev_box: "dict | None",
+    curr_box: dict,
+    movement_threshold: float = STABILITY_MOVEMENT_THRESHOLD,
+    scale_threshold:    float = STABILITY_SCALE_THRESHOLD,
+) -> bool:
+    """
+    Return True when the face has not moved significantly since the last frame.
+    Uses bounding-box centre displacement and height change as stability signals.
+    """
+    if prev_box is None:
+        return False
+
+    prev_cx = (prev_box["left"] + prev_box["right"]) / 2.0
+    prev_cy = (prev_box["top"]  + prev_box["bottom"]) / 2.0
+    curr_cx = (curr_box["left"] + curr_box["right"]) / 2.0
+    curr_cy = (curr_box["top"]  + curr_box["bottom"]) / 2.0
+    displacement = ((curr_cx - prev_cx) ** 2 + (curr_cy - prev_cy) ** 2) ** 0.5
+
+    prev_h = max(prev_box["bottom"] - prev_box["top"], 1)
+    curr_h = curr_box["bottom"] - curr_box["top"]
+    scale_change = abs(curr_h - prev_h) / prev_h
+
+    return displacement < movement_threshold and scale_change < scale_threshold
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -253,7 +313,12 @@ def _run_pipeline(frame_bgr: np.ndarray,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# OPTIMISED LIVE PIPELINE — downscaling + motion gating + split intervals
+# OPTIMISED LIVE PIPELINE — tiered frame processing with caching
+#
+# Every frame:       downscale + MOG2 motion detection
+# Every _CLAHE_EVERY frames: CLAHE enhancement (reuse cached result otherwise)
+# Every face_every frames:   face recog + landmarks + spoof (when motion exists)
+# Every yolo_every frames:   YOLO person / tailgating detection
 # ═══════════════════════════════════════════════════════════════════════════════
 def _run_pipeline_live(frame_bgr: np.ndarray,
                        security_mode: str,
@@ -261,13 +326,8 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
                        blink_tracker: BlinkTracker,
                        cache: dict) -> tuple:
     """
-    Lightweight pipeline for real-time webcam use.
-
-    Fast   CLAHE + MOG2           every frame on downscaled copy (_PROC_SCALE)
-    Slow-1 face recog + spoof     every face_every frames, skipped when no motion
-    Slow-2 YOLO tracking          every yolo_every frames
-
     Returns (annotated_frame, faces, decisions, spoofs, persons, tailgating, stage_log)
+    stage_log entries: (name, "computed" | "cached" | "skipped")
     """
     frame_n    = cache.get("frame_n",    0)
     face_every = cache.get("face_every", 3)
@@ -276,24 +336,29 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
     result    = frame_bgr.copy()
     stage_log = []
 
-    # ── FAST: CLAHE + motion on downscaled frame (every frame) ────────────────
+    # ── Every frame: downscale + MOG2 ────────────────────────────────────────
     S     = 1.0 / _PROC_SCALE
     small = cv2.resize(frame_bgr, (0, 0), fx=_PROC_SCALE, fy=_PROC_SCALE)
 
-    enhanced_s = apply_clahe(small)
-    stage_log.append(("Image enhancement", True))
-
     _, motion_regions_s = detect_motion(small)
-    stage_log.append(("Motion detection", True))
-
     motion_regions = [(int(x*S), int(y*S), int(w*S), int(h*S))
                       for x, y, w, h in motion_regions_s]
     draw_motion_regions(result, motion_regions)
+    stage_log.append(("Motion detection", "computed"))
 
     has_motion = bool(motion_regions_s)
     cache_warm = "faces" in cache
 
-    # ── SLOW-1: face recognition — every N frames, skipped when scene is still ─
+    # ── CLAHE — cached, recomputed every _CLAHE_EVERY frames ─────────────────
+    if frame_n % _CLAHE_EVERY == 0 or "enhanced_s" not in cache:
+        enhanced_s = apply_clahe(small)
+        cache["enhanced_s"] = enhanced_s
+        stage_log.append(("Image enhancement", "computed"))
+    else:
+        enhanced_s = cache["enhanced_s"]
+        stage_log.append(("Image enhancement", "cached"))
+
+    # ── SLOW-1: face recognition — every N frames when motion present ─────────
     run_face = (frame_n % face_every == 0) and (has_motion or not cache_warm)
 
     if run_face:
@@ -306,13 +371,45 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
 
         face_locs_s = [(f["top"], f["right"], f["bottom"], f["left"]) for f in faces_s]
         all_lm_s    = face_recognition.face_landmarks(rgb_s, face_locs_s) if faces_s else []
-
-        all_lm = [{k: [(int(x*S), int(y*S)) for x, y in pts]
-                   for k, pts in lm.items()} for lm in all_lm_s]
+        all_lm      = [{k: [(int(x*S), int(y*S)) for x, y in pts]
+                        for k, pts in lm.items()} for lm in all_lm_s]
 
         pad_lm_s = all_lm_s if all_lm_s else [{}] * len(faces)
         decisions, spoofs = _decide_faces(faces, pad_lm_s, frame_bgr, security_mode,
                                           blink_tracker=blink_tracker)
+
+        # ── Stability tracking (first face box) ───────────────────────────────
+        if faces:
+            curr_box = faces[0]
+            is_stable_frame = compute_face_stability(cache.get("last_face_box"), curr_box)
+            cache["last_face_box"] = curr_box
+            cache["stable_count"]  = (cache.get("stable_count", 0) + 1) if is_stable_frame else 0
+            cache["is_stable"]     = cache["stable_count"] >= STABILITY_REQUIRED_FRAMES
+        else:
+            cache["stable_count"] = 0
+            cache["is_stable"]    = False
+            cache.pop("last_face_box", None)
+
+        # ── Temporal + replay spoof enhancement (first face only) ─────────────
+        if faces and spoofs and not faces[0].get("blacklisted"):
+            roi = frame_bgr[faces[0]["top"]:faces[0]["bottom"],
+                            faces[0]["left"]:faces[0]["right"]]
+            if roi.size > 0:
+                curr_gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (64, 64))
+                t_result  = temporal_spoof_check(
+                    cache.get("prev_gray_face"), curr_gray, cache, security_mode
+                )
+                r_result  = replay_artifact_check(curr_gray)
+                agg       = aggregate_spoof_result(
+                    spoofs[0], blink_tracker.passed, t_result, r_result, security_mode
+                )
+                spoofs[0] = agg
+                # Override ALLOW→DENY when temporal/replay catches a spoof
+                if not agg["is_live"] and decisions[0]["action"] == "ALLOW":
+                    decisions[0] = make_decision(
+                        faces[0].get("match"), faces[0].get("confidence", 0.0),
+                        False, security_mode,
+                    )
 
         for face, decision in zip(faces, decisions):
             if face.get("blacklisted"):
@@ -334,43 +431,54 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
                     tailgating=False, source="live",
                 )
 
-        cache["faces"]     = faces
-        cache["decisions"] = decisions
-        cache["spoofs"]    = spoofs
-        cache["all_lm"]    = all_lm
-        cache["ear"]       = blink_tracker.last_ear
-
-        stage_log += [("Face recognition", True), ("Anti-spoofing", True), ("RBAC decision", True)]
+        cache.update({"faces": faces, "decisions": decisions,
+                      "spoofs": spoofs, "all_lm": all_lm,
+                      "ear": blink_tracker.last_ear})
+        stage_log += [
+            ("Face recognition", "computed"),
+            ("Anti-spoofing",    "computed"),
+            ("RBAC decision",    "computed"),
+        ]
     else:
         faces     = cache.get("faces",     [])
         decisions = cache.get("decisions", [])
         spoofs    = cache.get("spoofs",    [])
         all_lm    = cache.get("all_lm",    [])
-        stage_log += [("Face recognition", False), ("Anti-spoofing", False), ("RBAC decision", False)]
+        label = "cached" if cache_warm else "skipped"
+        stage_log += [
+            ("Face recognition", label),
+            ("Anti-spoofing",    label),
+            ("RBAC decision",    label),
+        ]
 
-    # ── SLOW-2: YOLO tracking (every yolo_every frames) ───────────────────────
+    # ── SLOW-2: YOLO person tracking ──────────────────────────────────────────
     if frame_n % yolo_every == 0:
         persons, tailgating = detect_and_track(result)
         cache["persons"]    = persons
         cache["tailgating"] = tailgating
-        stage_log.append(("Person tracking", True))
+        stage_log.append(("Person tracking", "computed"))
     else:
         persons    = cache.get("persons",    [])
         tailgating = cache.get("tailgating", False)
-        stage_log.append(("Person tracking", False))
+        stage_log.append(("Person tracking", "cached"))
 
+    # ── Draw overlays ──────────────────────────────────────────────────────────
     lm_pad = all_lm if all_lm else [{}] * len(faces)
     for face, decision, lm in zip(faces, decisions, lm_pad):
         draw_rbac_result(result, face, decision)
         if show_landmarks and lm:
             draw_landmarks(result, lm)
-
     draw_person_tracks(result, persons, tailgating)
 
+    # ── Status stamp — stability hint takes priority ───────────────────────────
+    is_stable  = cache.get("is_stable", False)
     any_granted = any(d["action"] == "ALLOW" for d in decisions)
-    stamp_status(result,
-                 "ACCESS GRANTED" if any_granted else "ACCESS DENIED",
-                 (0, 200, 0) if any_granted else (0, 0, 220))
+    if faces and not is_stable:
+        stamp_status(result, "HOLD STILL", (0, 200, 255))
+    elif any_granted:
+        stamp_status(result, "ACCESS GRANTED", (0, 200, 0))
+    else:
+        stamp_status(result, "ACCESS DENIED",  (0, 0, 220))
 
     stamp_ear(result, cache.get("ear", 1.0), blink_tracker.blink_count, blink_tracker.passed)
 
@@ -422,10 +530,11 @@ def _render_verdict(faces: list, decisions: list) -> str:
 @st.fragment
 def _live_camera_loop():
     if not st.session_state.get("cam_running", False):
-        st.info("Press Start to begin live access control.")
+        st.info("Press **Start** to begin live access control.")
         return
 
-    sec_mode = st.session_state.get("live_sec",  "normal")
+    hq       = st.session_state.get("live_hq",   True)
+    sec_mode = "normal" if hq else "relaxed"
     show_lm  = st.session_state.get("live_lm",   True)
     face_ev  = st.session_state.get("live_skip", 3)
     yolo_ev  = st.session_state.get("live_yolo", 5)
@@ -513,7 +622,7 @@ def _live_camera_loop():
         )
 
         # Current stage
-        active = next((n for n, ran in reversed(stage_log) if ran), "Idle")
+        active = next((n for n, s in reversed(stage_log) if s == "computed"), "Idle")
         st.markdown(f":material/bolt: **Stage:** `{active}`")
 
         # User identity
@@ -528,18 +637,30 @@ def _live_camera_loop():
         else:
             st.markdown(":material/no_accounts: **User:** `No face detected`")
 
-        # Liveness
+        # Stability
+        is_stable = live_cache.get("is_stable", False)
+        if faces and not is_stable:
+            st.info(":material/timer: **Stability:** Hold still for scan…")
+        elif faces:
+            st.markdown(":material/check_circle: **Stability:** Face stable")
+        else:
+            st.markdown(":material/radio_button_unchecked: **Stability:** No face")
+
+        # Liveness / spoof
         if spoofs:
-            sp = spoofs[0]
+            sp      = spoofs[0]
+            sp_stat = sp.get("status", "LIVE" if sp.get("is_live", True) else "SPOOF SUSPECTED")
             if sp.get("is_live", True):
-                st.markdown(":material/visibility: **Liveness:** `LIVE`")
+                st.markdown(f":material/visibility: **Liveness:** `{sp_stat}`")
             else:
-                st.markdown(":material/visibility_off: **Liveness:** `SPOOF DETECTED`")
+                st.markdown(f":material/visibility_off: **Liveness:** `{sp_stat}`")
             if sp.get("ear") is not None:
                 st.caption(
-                    f"EAR: {sp['ear']:.3f}  |  Blinks: {tracker.blink_count}  |  "
-                    f"OK: {'Yes' if tracker.passed else 'No — blink once'}"
+                    f"EAR: {sp['ear']:.3f}  ·  Blinks: {tracker.blink_count}  ·  "
+                    f"{'✓ Liveness OK' if tracker.passed else 'Waiting for blink…'}"
                 )
+            if sp.get("suspicious_static"):
+                st.caption(":material/warning: Motion check: suspiciously static — possible replay")
         else:
             st.markdown(":material/visibility: **Liveness:** `—`")
 
@@ -549,29 +670,37 @@ def _live_camera_loop():
         st.markdown(_render_verdict(faces, decisions), unsafe_allow_html=True)
 
         if tailgating:
-            st.warning(":material/group: Tailgating — multiple persons detected!")
+            st.warning(":material/group: **Tailgating** — multiple persons detected in frame!")
+        if not hq:
+            st.caption(":material/info: Low quality camera mode — anti-spoofing accuracy reduced.")
 
         st.divider()
 
         # Pipeline stage progress
         st.markdown(":material/timeline: **Pipeline**")
-        computed = sum(1 for _, ran in stage_log if ran)
+        computed = sum(1 for _, s in stage_log if s == "computed")
         total    = len(stage_log)
         st.progress(computed / total if total else 0,
                     text=f"{computed}/{total} stages computed this frame")
 
-        for stage_name, ran in stage_log:
-            if ran:
-                st.markdown(f":material/check_circle: {stage_name} `computed`")
-            else:
-                st.markdown(f":material/radio_button_unchecked: {stage_name} `cached`")
+        _STATUS_ICON = {
+            "computed": ":material/check_circle:",
+            "cached":   ":material/radio_button_unchecked:",
+            "skipped":  ":material/block:",
+        }
+        for stage_name, stage_status in stage_log:
+            icon = _STATUS_ICON.get(stage_status, ":material/radio_button_unchecked:")
+            st.markdown(f"{icon} {stage_name} `{stage_status}`")
 
     time.sleep(0.03)
     st.rerun()   # fragment-scoped: sidebar and other pages are untouched
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TERMINAL PIPELINE  — targeted 1-vs-1 verification for Security Terminal
+# TERMINAL PIPELINE — targeted MFA verification for Security Terminal
+#
+# Order: YOLO tailgating → face detection → stability gate → blacklist →
+#        blink liveness → spoof (static + temporal + replay) → identity
 # ═══════════════════════════════════════════════════════════════════════════════
 def _run_terminal_pipeline(frame_bgr: np.ndarray,
                            claimed_username: str,
@@ -579,75 +708,143 @@ def _run_terminal_pipeline(frame_bgr: np.ndarray,
                            blink_tracker,
                            cache: dict) -> tuple:
     """
-    Security Terminal pipeline — blacklist-first, then 1-vs-1 identity check.
+    Security Terminal pipeline.
 
-    Returns (annotated_frame, decision_or_None, spoof_or_None)
-      decision is non-None only when a definitive outcome is reached:
-        ALLOW  — claimed user verified + liveness confirmed
-        ALERT  — blacklisted face detected (stop immediately)
-      While still scanning (face found but not yet confirmed) returns None.
+    Returns (annotated_frame, decision_or_None, spoof_or_None, tailgating, status_msg)
+      decision is non-None only for a definitive outcome (ALLOW / ALERT / tailgating DENY).
+      status_msg: 'NO FACE' | 'HOLD STILL' | 'TAILGATING' | 'BLINK REQUIRED' |
+                  'SPOOF' | 'BLACKLISTED' | 'SCANNING' | 'COMPLETE'
     """
     frame_n    = cache.get("frame_n", 0)
-    run_recog  = frame_n % 2 == 0       # recognition every other frame
+    run_recog  = frame_n % 2 == 0
+    yolo_every = 5
     result     = frame_bgr.copy()
 
-    S     = 1.0 / _PROC_SCALE
-    small = cv2.resize(frame_bgr, (0, 0), fx=_PROC_SCALE, fy=_PROC_SCALE)
+    S          = 1.0 / _PROC_SCALE
+    small      = cv2.resize(frame_bgr, (0, 0), fx=_PROC_SCALE, fy=_PROC_SCALE)
     enhanced_s = apply_clahe(small)
     rgb_s      = cv2.cvtColor(enhanced_s, cv2.COLOR_BGR2RGB)
 
+    # ── YOLO tailgating (every yolo_every frames) ─────────────────────────────
+    if frame_n % yolo_every == 0:
+        persons, tailgating = detect_and_track(result)
+        cache["persons"]    = persons
+        cache["tailgating"] = tailgating
+    else:
+        persons    = cache.get("persons",    [])
+        tailgating = cache.get("tailgating", False)
+    draw_person_tracks(result, persons, tailgating)
+
+    # ── Face detection ────────────────────────────────────────────────────────
     face_locs_s = face_recognition.face_locations(rgb_s, model="hog")
     if not face_locs_s:
-        cache["frame_n"] = frame_n + 1
+        cache["frame_n"]      = frame_n + 1
+        cache["stable_count"] = 0
         stamp_status(result, "NO FACE DETECTED", (160, 160, 160))
-        return result, None, None
+        return result, None, None, tailgating, "NO FACE"
 
     face_enc_s = face_recognition.face_encodings(rgb_s, face_locs_s)
     all_lm_s   = face_recognition.face_landmarks(rgb_s, face_locs_s)
 
-    # Use first detected face only (terminal = single-person flow)
     enc_s = face_enc_s[0]
     lm_s  = all_lm_s[0] if all_lm_s else {}
     loc_s = face_locs_s[0]
-    top_f = int(loc_s[0]*S); right_f = int(loc_s[1]*S)
-    bot_f = int(loc_s[2]*S); left_f  = int(loc_s[3]*S)
+    top_f  = int(loc_s[0] * S); right_f = int(loc_s[1] * S)
+    bot_f  = int(loc_s[2] * S); left_f  = int(loc_s[3] * S)
     face_box = {"top": top_f, "right": right_f, "bottom": bot_f, "left": left_f}
 
-    # Landmarks for liveness (full-res coords)
+    # ── Stability gate ────────────────────────────────────────────────────────
+    is_stable_frame = compute_face_stability(cache.get("last_face_box"), face_box)
+    cache["last_face_box"] = face_box
+    cache["stable_count"]  = (cache.get("stable_count", 0) + 1) if is_stable_frame else 0
+    is_stable = cache["stable_count"] >= STABILITY_REQUIRED_FRAMES
+
     lm_full = {k: [(int(x*S), int(y*S)) for x, y in pts] for k, pts in lm_s.items()}
     if lm_full:
-        blink_tracker.update(lm_s)     # EAR uses small-frame landmarks
+        blink_tracker.update(lm_s)   # EAR uses small-frame landmarks
 
-    # Face chip for static spoof check
-    roi = frame_bgr[top_f:bot_f, left_f:right_f]
+    if not is_stable:
+        stable_pending = {
+            "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+            "label": "Hold still…", "reason": "Waiting for stable face",
+            "name": "", "username": "",
+        }
+        draw_rbac_result(result, face_box, stable_pending)
+        stamp_status(result, "HOLD STILL", (0, 200, 255))
+        cache["frame_n"] = frame_n + 1
+        return result, None, None, tailgating, "HOLD STILL"
+
+    # ── Tailgating gate (after stability confirmed) ───────────────────────────
+    if tailgating:
+        tg_pending = {
+            "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+            "label": "Tailgating detected", "reason": "Multiple persons in frame",
+            "name": "", "username": "",
+        }
+        draw_rbac_result(result, face_box, tg_pending)
+        stamp_status(result, "TAILGATING ALERT", (0, 0, 220))
+        cache["frame_n"] = frame_n + 1
+        return result, None, None, tailgating, "TAILGATING"
+
+    # ── Face chip for spoof checks ────────────────────────────────────────────
+    roi  = frame_bgr[top_f:bot_f, left_f:right_f]
     gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (64, 64)) if roi.size > 0 else None
     spoof = static_spoof_check(gray, lm_s) if gray is not None else dict(_SPOOF_FALLBACK)
-    spoof["is_live"] = spoof["is_live"] and blink_tracker.passed
 
-    decision = None
+    if gray is not None:
+        t_result = temporal_spoof_check(cache.get("prev_gray_face"), gray, cache, security_mode)
+        r_result = replay_artifact_check(gray)
+        spoof    = aggregate_spoof_result(spoof, blink_tracker.passed, t_result, r_result, security_mode)
+    else:
+        spoof["is_live"] = spoof.get("is_live", True) and blink_tracker.passed
+        spoof.setdefault("status", "LIVE" if spoof["is_live"] else "WAITING FOR BLINK")
+
+    decision   = None
+    status_msg = "SCANNING"
 
     if run_recog:
-        # ── Step 1: Blacklist check FIRST ─────────────────────────────────────
-        is_bl, bl_entry, bl_conf = check_blacklist(enc_s)
+        # ── Priority 1: Blacklist check FIRST ─────────────────────────────────
+        is_bl, bl_entry, _ = check_blacklist(enc_s)
         if is_bl:
             decision = make_blacklist_decision(bl_entry)
             draw_rbac_result(result, face_box, decision)
             stamp_status(result, "SECURITY ALERT", (0, 0, 220))
             cache["frame_n"] = frame_n + 1
-            return result, decision, spoof
+            return result, decision, spoof, tailgating, "BLACKLISTED"
 
-        # ── Step 2: Verify claimed identity ───────────────────────────────────
+        # ── Priority 2: Liveness gate ──────────────────────────────────────────
+        if not blink_tracker.passed:
+            blink_pending = {
+                "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+                "label": "Blink once to confirm liveness…",
+                "reason": "Waiting for blink", "name": "", "username": "",
+            }
+            draw_rbac_result(result, face_box, blink_pending)
+            stamp_ear(result, getattr(blink_tracker, "last_ear", 1.0),
+                      blink_tracker.blink_count, blink_tracker.passed)
+            stamp_status(result, "BLINK ONCE", (0, 200, 255))
+            cache["frame_n"] = frame_n + 1
+            return result, None, spoof, tailgating, "BLINK REQUIRED"
+
+        # ── Priority 3: Spoof gate ─────────────────────────────────────────────
+        if not spoof.get("is_live", True):
+            spoof_decision = {
+                "action": "DENY", "role": "spoof", "color": ROLE_COLORS["spoof"],
+                "label": f"Anti-spoofing failed — {spoof.get('status', 'SPOOF SUSPECTED')}",
+                "reason": "Possible replay/print attack", "name": "", "username": "",
+            }
+            draw_rbac_result(result, face_box, spoof_decision)
+            stamp_status(result, "SPOOF SUSPECTED", (0, 80, 255))
+            cache["frame_n"] = frame_n + 1
+            return result, spoof_decision, spoof, tailgating, "SPOOF"
+
+        # ── Priority 4: Identity verification ─────────────────────────────────
         match, confidence = verify_claimed_user(enc_s, claimed_username, security_mode)
-
-        if match and spoof["is_live"]:
-            decision = make_decision(match, confidence, True, security_mode)
-        elif match and not spoof["is_live"]:
-            decision = make_decision(match, confidence, False, security_mode)
+        if match:
+            decision = make_decision(match, confidence, spoof.get("is_live", True), security_mode)
         else:
-            # Not yet matched — keep scanning, show live feedback
             pending = {
-                "action": "DENY", "role": "unknown",
-                "color": ROLE_COLORS["unknown"],
+                "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
                 "label": f"Verifying… ({confidence:.0%})",
                 "reason": "Scanning", "name": "", "username": "",
             }
@@ -656,32 +853,26 @@ def _run_terminal_pipeline(frame_bgr: np.ndarray,
         cache["last_match"]      = match
         cache["last_confidence"] = confidence if match else 0.0
     else:
-        # Draw last known state between recognition frames
+        # Show last known state between recognition frames
         last_label = f"Verifying… ({cache.get('last_confidence', 0.0):.0%})"
         pending = {
-            "action": "DENY", "role": "unknown",
-            "color": ROLE_COLORS["unknown"],
-            "label": last_label,
-            "reason": "Scanning", "name": "", "username": "",
+            "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+            "label": last_label, "reason": "Scanning", "name": "", "username": "",
         }
         draw_rbac_result(result, face_box, pending)
 
-    # Only a definitive ALLOW or ALERT exits the scan loop
     if decision and decision["action"] in ("ALLOW", "ALERT"):
         stamp_status(result,
                      "ACCESS GRANTED" if decision["action"] == "ALLOW" else "SECURITY ALERT",
                      (0, 200, 0) if decision["action"] == "ALLOW" else (0, 0, 220))
         cache["frame_n"] = frame_n + 1
-        return result, decision, spoof
+        return result, decision, spoof, tailgating, "COMPLETE"
 
     stamp_ear(result, getattr(blink_tracker, "last_ear", 1.0),
               blink_tracker.blink_count, blink_tracker.passed)
     stamp_status(result, "SCANNING…", (0, 140, 255))
     cache["frame_n"] = frame_n + 1
-    return result, None, spoof
-
-
-from modules.rbac_engine import ROLE_COLORS  # needed by terminal pipeline above
+    return result, None, spoof, tailgating, status_msg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -794,11 +985,17 @@ elif page == "Security Terminal":
 
         col_ctrl, _ = st.columns([2, 3])
         with col_ctrl:
-            sec_mode = st.select_slider(
-                "Security mode", SECURITY_OPTIONS, value=sec_mode,
-                key="terminal_sec_slider",
+            hq = st.toggle(
+                "High quality camera", value=True, key="terminal_hq",
+                help="ON = normal anti-spoofing. OFF = relaxed thresholds (less accurate).",
             )
+            sec_mode = "normal" if hq else "relaxed"
             st.session_state["terminal_sec_mode"] = sec_mode
+            if not hq:
+                st.warning(
+                    "Low camera quality mode — anti-spoofing accuracy may be reduced. "
+                    "False failures possible with poor lighting."
+                )
             if st.button("Cancel", icon=":material/cancel:", use_container_width=True):
                 cap_ref = st.session_state.pop("terminal_cap", None)
                 if cap_ref:
@@ -825,7 +1022,7 @@ elif page == "Security Terminal":
         ret, frame = cap.read()
 
         if ret:
-            annotated, decision, spoof = _run_terminal_pipeline(
+            annotated, decision, spoof, term_tailgating, term_status = _run_terminal_pipeline(
                 frame, claimed_username, sec_mode, blink_tracker, t_cache
             )
             st.session_state["terminal_cache"] = t_cache
@@ -835,16 +1032,32 @@ elif page == "Security Terminal":
                 st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
                          use_container_width=True)
             with col_panel:
-                if blink_tracker.passed:
-                    st.success(":material/visibility: Liveness confirmed")
+                # Stability status
+                stable_ct = t_cache.get("stable_count", 0)
+                if stable_ct < STABILITY_REQUIRED_FRAMES:
+                    st.info(f":material/timer: Hold still… ({stable_ct}/{STABILITY_REQUIRED_FRAMES} frames)")
                 else:
-                    st.info(f":material/visibility: Blinks detected: {blink_tracker.blink_count} — blink once")
+                    st.success(":material/check_circle: Face stable")
 
+                # Liveness
+                sp_stat = (spoof or {}).get("status", "—")
+                if blink_tracker.passed:
+                    st.success(f":material/visibility: Liveness: `{sp_stat}`")
+                else:
+                    st.info(f":material/visibility: Blinks: {blink_tracker.blink_count} — blink once")
+
+                # Spoof
                 if spoof and not spoof.get("is_live", True):
-                    st.error(":material/block: Anti-spoofing check failed")
+                    st.error(f":material/block: Anti-spoofing: `{sp_stat}`")
+                    if spoof.get("suspicious_static"):
+                        st.caption("Motion check failed — possible replay attack")
 
+                # Tailgating warning
+                if term_tailgating:
+                    st.error(":material/group: **Tailgating** — multiple persons detected! Access blocked.")
+
+            # ── Definitive outcome: ALLOW or ALERT ────────────────────────────
             if decision and decision["action"] in ("ALLOW", "ALERT"):
-                # Definitive outcome — stop scanning, log event, transition
                 log_access_event(
                     detected_name=decision.get("name", user_data.get("name", "")),
                     username=claimed_username,
@@ -852,13 +1065,38 @@ elif page == "Security Terminal":
                     confidence=t_cache.get("last_confidence", 0.0),
                     action=decision["action"],
                     reason=decision.get("reason", ""),
-                    tailgating=False,
+                    tailgating=term_tailgating,
                     source="terminal",
                 )
                 cap.release()
                 st.session_state.pop("terminal_cap", None)
                 st.session_state["terminal_state"]  = "result"
                 st.session_state["terminal_result"] = decision
+                st.rerun()
+
+            # ── Tailgating denial — stop scan and transition ───────────────────
+            if term_status == "TAILGATING":
+                tg_decision = {
+                    "action": "DENY",
+                    "label":  "Tailgating detected",
+                    "reason": "Multiple persons detected in access zone",
+                    "role":   "unknown", "color": ROLE_COLORS["unknown"],
+                    "name":   "", "username": "",
+                }
+                log_access_event(
+                    detected_name=user_data.get("name", claimed_username),
+                    username=claimed_username,
+                    role="unknown",
+                    confidence=0.0,
+                    action="DENY",
+                    reason="Tailgating detected",
+                    tailgating=True,
+                    source="terminal",
+                )
+                cap.release()
+                st.session_state.pop("terminal_cap", None)
+                st.session_state["terminal_state"]  = "result"
+                st.session_state["terminal_result"] = tg_decision
                 st.rerun()
 
         st.session_state["terminal_frame_n"] = st.session_state.get("terminal_frame_n", 0) + 1
@@ -1039,12 +1277,16 @@ elif page == "Register User":
                     ok, msg = create_user(name.strip(), username.strip(), password, role, enc)
                     prog.progress(1.0)
 
+                    _knn_ok  = False
+                    _knn_msg = ""
                     if ok:
-                        st.write("User created")
-                        st.write("Retraining KNN classifier on updated face set…")
-                        knn_ok, knn_msg = train_knn()
-                        if knn_ok:
-                            st.write(f"KNN updated: {knn_msg}")
+                        st.write("User created successfully.")
+                        st.write("Updating KNN classifier with new face data…")
+                        _knn_ok, _knn_msg = train_knn()
+                        if _knn_ok:
+                            st.write(f"KNN updated: {_knn_msg}")
+                        else:
+                            st.write(f"KNN retraining warning: {_knn_msg}")
                         prog.progress(1.0)
                         status.update(label="Enrolment complete!", state="complete")
                     else:
@@ -1053,6 +1295,11 @@ elif page == "Register User":
                         st.stop()
 
                 st.success(msg)
+                if not _knn_ok and ok:
+                    st.warning(
+                        f"KNN retraining failed ({_knn_msg}). "
+                        "Use **Admin Panel → Retrain KNN Model** to update manually."
+                    )
 
                 if sample_feat:
                     st.subheader("Classical feature outputs")
@@ -1255,8 +1502,60 @@ elif page == "Identify: Image":
 
     col_opts, _ = st.columns([2, 3])
     with col_opts:
-        sec_mode       = st.select_slider("Security mode", SECURITY_OPTIONS, value="normal")
+        hq             = st.toggle("High quality camera", value=True,
+                                   help="ON = normal thresholds. OFF = relaxed anti-spoofing.")
+        sec_mode       = "normal" if hq else "relaxed"
         show_landmarks = st.checkbox("Show facial landmarks", value=True)
+        if not hq:
+            st.caption(":material/warning: Low quality mode — anti-spoofing thresholds relaxed.")
+
+    # ── Test samples panel ────────────────────────────────────────────────────
+    with st.expander(":material/folder: Test samples", expanded=False):
+        _img_files = sorted(
+            f for f in os.listdir(TEST_IMAGE_DIR)
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        ) if os.path.isdir(TEST_IMAGE_DIR) else []
+        _spoof_files = sorted(
+            f for f in os.listdir(TEST_SPOOF_DIR)
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        ) if os.path.isdir(TEST_SPOOF_DIR) else []
+        _tail_files = sorted(
+            f for f in os.listdir(TEST_TAILGATE_DIR)
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        ) if os.path.isdir(TEST_TAILGATE_DIR) else []
+
+        if not (_img_files or _spoof_files or _tail_files):
+            st.info(
+                f"No test samples found. Add images to:\n"
+                f"- `{TEST_IMAGE_DIR}/` — general detection samples\n"
+                f"- `{TEST_SPOOF_DIR}/` — spoof/replay samples\n"
+                f"- `{TEST_TAILGATE_DIR}/` — tailgating samples"
+            )
+        else:
+            if _img_files:
+                st.markdown("**Image detection samples**")
+                _cols = st.columns(min(len(_img_files), 4))
+                for _i, _fname in enumerate(_img_files[:8]):
+                    _img = cv2.imread(os.path.join(TEST_IMAGE_DIR, _fname))
+                    if _img is not None:
+                        _cols[_i % 4].image(cv2.cvtColor(_img, cv2.COLOR_BGR2RGB),
+                                            caption=_fname[:30], use_container_width=True)
+            if _spoof_files:
+                st.markdown("**Spoof / replay samples**")
+                _cols = st.columns(min(len(_spoof_files), 4))
+                for _i, _fname in enumerate(_spoof_files[:8]):
+                    _img = cv2.imread(os.path.join(TEST_SPOOF_DIR, _fname))
+                    if _img is not None:
+                        _cols[_i % 4].image(cv2.cvtColor(_img, cv2.COLOR_BGR2RGB),
+                                            caption=_fname[:30], use_container_width=True)
+            if _tail_files:
+                st.markdown("**Tailgating samples**")
+                _cols = st.columns(min(len(_tail_files), 4))
+                for _i, _fname in enumerate(_tail_files[:8]):
+                    _img = cv2.imread(os.path.join(TEST_TAILGATE_DIR, _fname))
+                    if _img is not None:
+                        _cols[_i % 4].image(cv2.cvtColor(_img, cv2.COLOR_BGR2RGB),
+                                            caption=_fname[:30], use_container_width=True)
 
     if uploaded and st.button("Run Full Pipeline", type="primary",
                               icon=":material/play_arrow:"):
@@ -1379,7 +1678,10 @@ elif page == "Live Camera":
         "Stop", icon=":material/stop:",
         key="live_stop", use_container_width=True, disabled=not cam_running,
     )
-    c3.select_slider("Security mode", SECURITY_OPTIONS, value="normal", key="live_sec")
+    c3.toggle(
+        "High quality camera", value=True, key="live_hq",
+        help="ON: normal anti-spoofing.  OFF: relaxed thresholds (less accurate).",
+    )
     c4.checkbox("Show landmarks", value=True, key="live_lm")
 
     # Row 2 — performance sliders
@@ -1388,6 +1690,12 @@ elif page == "Live Camera":
               help="Higher = faster feed, less frequent recognition")
     s2.slider("Tracking interval (frames)", 2, 15, 5, key="live_yolo",
               help="Higher = faster feed, less frequent person tracking")
+
+    if not st.session_state.get("live_hq", True):
+        st.warning(
+            ":material/warning: Low camera quality mode — anti-spoofing accuracy "
+            "is reduced. False failures may occur under poor lighting or low resolution."
+        )
 
     st.divider()
 
@@ -1400,6 +1708,7 @@ elif page == "Live Camera":
         })
         reset_tracker()
         reset_background_model()
+        st.rerun()   # force a clean full-page rerun so the fragment starts on first click
 
     if stop:
         st.session_state["cam_running"] = False
@@ -1582,8 +1891,8 @@ elif page == "Access Log":
             default=["ALLOW", "DENY", "ALERT"],
         )
         source_filter = col_f2.multiselect(
-            "Filter by source", ["image", "live"],
-            default=["image", "live"],
+            "Filter by source", ["image", "live", "terminal"],
+            default=["image", "live", "terminal"],
         )
 
         mask = df["action"].isin(action_filter) & df["source"].isin(source_filter)

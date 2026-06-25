@@ -141,3 +141,119 @@ def static_spoof_check(gray_chip: np.ndarray, landmarks: dict = None) -> dict:
         "ear":              round(ear, 3) if ear is not None else None,
         "is_live":          is_live,
     }
+
+
+# ── Temporal motion check ─────────────────────────────────────────────────────
+
+def temporal_spoof_check(
+    prev_gray: "np.ndarray | None",
+    curr_gray: np.ndarray,
+    cache: dict,
+    security_mode: str = "normal",
+) -> dict:
+    """
+    Frame-to-frame pixel-difference check for live vs. replay/static attacks.
+    A real face has natural micro-motion; a still replay has near-zero difference.
+    Updates cache['prev_gray_face'] for the next call.
+    """
+    result = {"motion_score": 0.0, "motion_ok": True, "suspicious_static": False}
+
+    if prev_gray is None or prev_gray.shape != curr_gray.shape:
+        cache["prev_gray_face"] = curr_gray.copy()
+        return result
+
+    diff = cv2.absdiff(prev_gray, curr_gray)
+    motion_score = float(np.mean(diff))
+    result["motion_score"] = round(motion_score, 3)
+
+    # Below this level the face is suspiciously static (printed / paused replay)
+    static_thresh = {"strict": 1.5, "normal": 1.0, "relaxed": 0.5}.get(security_mode, 1.0)
+    result["suspicious_static"] = motion_score < static_thresh
+    result["motion_ok"] = not result["suspicious_static"]
+
+    cache["prev_gray_face"] = curr_gray.copy()
+    return result
+
+
+# ── Replay / screen artifact heuristic ───────────────────────────────────────
+
+def replay_artifact_check(gray_face: np.ndarray) -> dict:
+    """
+    DCT frequency-domain check for screen/print artifacts.
+    Replay attacks via a screen may have unnaturally low or periodic
+    high-frequency content compared with real skin texture.
+    """
+    f32 = np.float32(gray_face)
+    dct = cv2.dct(f32)
+    h, w = dct.shape
+
+    total_energy = float(np.sum(np.abs(dct))) + 1e-6
+    low_energy   = float(np.sum(np.abs(dct[:h // 4, :w // 4])))
+    high_energy  = float(np.sum(np.abs(dct[h // 4:, w // 4:])))
+
+    freq_ratio = high_energy / (low_energy + 1e-6)
+    low_ratio  = low_energy / total_energy
+
+    # Natural face: moderate freq_ratio; flat/screen dominated by low-freq DC
+    freq_ok = 0.02 < freq_ratio < 20.0 and low_ratio < 0.97
+
+    return {
+        "freq_ratio": round(freq_ratio, 3),
+        "low_ratio":  round(low_ratio,  3),
+        "freq_ok":    freq_ok,
+    }
+
+
+# ── Spoof score aggregation ───────────────────────────────────────────────────
+
+def aggregate_spoof_result(
+    static_result:   dict,
+    blink_passed:    bool,
+    temporal_result: "dict | None" = None,
+    replay_result:   "dict | None" = None,
+    security_mode:   str = "normal",
+) -> dict:
+    """
+    Combine all spoof signals (static, blink, temporal, replay) into one verdict.
+
+    strict:  blink + texture + laplacian + temporal motion + frequency all required
+    normal:  blink + texture + laplacian required; temporal/replay used to downgrade
+    relaxed: blink required; static checks advisory; temporal only for full statics
+    """
+    tex_ok      = static_result.get("texture_ok",   True)
+    lap_ok      = static_result.get("laplacian_ok", True)
+    susp_static = (temporal_result or {}).get("suspicious_static", False)
+    motion_ok   = (temporal_result or {}).get("motion_ok",   True)
+    freq_ok     = (replay_result   or {}).get("freq_ok",     True)
+
+    if security_mode == "strict":
+        is_live = blink_passed and tex_ok and lap_ok and motion_ok and freq_ok
+    elif security_mode == "relaxed":
+        is_live = blink_passed
+        if susp_static and not motion_ok:   # even relaxed catches completely static frames
+            is_live = False
+    else:  # normal
+        is_live = blink_passed and tex_ok and lap_ok
+        if is_live and susp_static:         # temporal check downgrades suspicious statics
+            is_live = False
+
+    if is_live:
+        status = "LIVE"
+    elif not blink_passed:
+        status = "WAITING FOR BLINK"
+    else:
+        status = "SPOOF SUSPECTED"
+
+    return {
+        "is_live":           is_live,
+        "status":            status,
+        "texture_ok":        tex_ok,
+        "laplacian_ok":      lap_ok,
+        "motion_ok":         motion_ok,
+        "freq_ok":           freq_ok,
+        "blink_passed":      blink_passed,
+        "suspicious_static": susp_static,
+        "texture_variance":  static_result.get("texture_variance", 0.0),
+        "laplacian_score":   static_result.get("laplacian_score",  0.0),
+        "ear":               static_result.get("ear"),
+    }
