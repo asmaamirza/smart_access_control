@@ -2,7 +2,7 @@
 **CSCI435 — Computer Vision Algorithms and Systems**  
 University of Wollongong in Dubai
 
-A deployable Streamlit web application that implements enterprise-grade physical access control using **10 integrated computer vision techniques**, a two-factor authentication terminal, anti-spoofing liveness detection, a threat blacklist, and a role-based access decision engine.
+A deployable Streamlit web application that implements enterprise-grade physical access control using **11 integrated computer vision techniques**, a two-factor authentication terminal, anti-spoofing liveness detection, a threat blacklist, and a role-based access decision engine.
 
 ---
 
@@ -11,15 +11,16 @@ A deployable Streamlit web application that implements enterprise-grade physical
 | # | Capability | Implementation |
 |---|---|---|
 | 1 | Image enhancement | CLAHE on CIE-LAB luminance channel — normalises uneven lighting before detection |
-| 2 | Edge detection | Canny on aligned 64×64 face chip — part of KNN feature vector |
-| 3 | Keypoint detection | dlib 68-point facial landmark predictor — eyes, nose, mouth |
-| 4 | Object detection | YOLOv8n (COCO-pretrained) — person detection for tailgating |
-| 5 | Object recognition | dlib ResNet-34 128-d face embedding + Euclidean distance matching |
-| 6 | Face detection / recognition | HOG+SVM detector + ResNet identity matching |
-| 7 | Video processing | Frame-by-frame webcam loop with `@st.fragment`; motion-gated recognition |
-| 8 | Change detection & background modelling | MOG2 Gaussian Mixture Model foreground/background separation |
-| 9 | Object tracking | YOLOv8n person detection; tailgating flagged when `len(detections) > 1` |
-| 10 | Binary morphological operations | Dilate + erode on MOG2 foreground mask to remove noise |
+| 2 | Edge detection | Canny on aligned 64×64 face chip — structural descriptor in KNN feature vector |
+| 3 | Keypoint detection | dlib 68-point facial landmark predictor — eyes, nose, mouth positions |
+| 4 | Object detection | YOLOv8n-seg (COCO-pretrained) — person detection for tailgating |
+| 5 | Image segmentation | YOLOv8n-seg instance masks — per-pixel person segmentation drawn as overlay |
+| 6 | Object recognition | dlib ResNet-34 128-d face embedding + Euclidean distance matching |
+| 7 | Face detection / recognition | HOG+SVM detector + ResNet identity matching |
+| 8 | Video processing | Frame-by-frame webcam loop (`@st.fragment`) and uploaded video file processing |
+| 9 | Change detection & background modelling | MOG2 Gaussian Mixture Model foreground/background separation |
+| 10 | Object tracking | YOLOv8n-seg person detection; tailgating flagged when `len(detections) > 1` |
+| 11 | Binary morphological operations | Named `apply_morphology()` — closing then dilation on MOG2 foreground mask |
 
 ---
 
@@ -112,24 +113,33 @@ After enrolment the KNN classifier is automatically retrained on all enrolled fa
 
 ### Identify: Image
 Upload a JPG/PNG and run the full pipeline in one click:
-- CLAHE → HOG detection → ResNet matching → anti-spoofing → RBAC decision
-- Shows annotated result image, access decision, KNN secondary verification, and intermediate CV outputs (Canny edge map, LBP texture, HOG gradients)
+- CLAHE → HOG detection → ResNet matching → anti-spoofing → RBAC decision → YOLOv8n-seg tailgating
+- Shows annotated result, access decision, KNN secondary verification, and intermediate CV outputs (Canny edge map, LBP texture, HOG gradients)
+- Expandable **Background model** panel showing the MOG2 foreground mask after morphological operations
+
+### Identify: Video *(third input modality)*
+Upload a video file (MP4, AVI, MOV, MKV) and run the full pipeline on sampled frames:
+- Configurable frame stride (process every N frames) for speed control
+- Displays summary stats: frames granted / denied / tailgating count
+- Shows a grid of up to 8 annotated sample frames with per-frame verdict labels
 
 ### Live Camera
 Real-time webcam feed with full pipeline:
-- Start/Stop controls, security mode slider (strict / normal / relaxed), landmark toggle
+- Start/Stop controls, security mode toggle, landmark toggle
 - Frame-skip sliders for face recognition and YOLO intervals
 - Live FPS counter, blink counter, and pipeline stage indicator
 - Tailgating alert when more than one person is tracked simultaneously
+- Person segmentation masks drawn as semi-transparent overlays
 
 ### Admin Panel
 - View system stats (total users, ALLOW/DENY/ALERT counts)
 - Retrain the KNN classifier manually
 - Change user roles or remove users
 - View and remove blacklist entries
+- **Benchmark** — runs ResNet + KNN recognition on every enrolled image and reports top-1 accuracy, average confidence, and per-frame latency
 
 ### Access Log
-Searchable, filterable table of every access event with timestamp, name, role, confidence, action, and source (image / live / terminal).
+Searchable, filterable table of every access event with timestamp, name, role, confidence, action, and source (image / video / live / terminal).
 
 ---
 
@@ -146,13 +156,15 @@ Searchable, filterable table of every access event with timestamp, name, role, c
 ## Pipeline Order (all modes)
 
 ```
-Frame → CLAHE → MOG2 motion gate → HOG face detect
+Frame → CLAHE enhancement
+      → MOG2 background subtraction → apply_morphology() → motion regions
+      → HOG face detection → 68-point landmark extraction
       → BLACKLIST CHECK FIRST (0.50 threshold, always strict)
          ↳ Match → ALERT + stop
          ↳ No match → ResNet 1-vs-1 verify (Terminal) or full-DB search (Live/Image)
-      → Anti-spoofing (EAR blink + LBP texture + Laplacian sharpness)
+      → Anti-spoofing (EAR blink + LBP texture + Laplacian + temporal + DCT replay)
       → RBAC decision (ALLOW / DENY / ALERT)
-      → YOLOv8n + ByteTrack tailgating check
+      → YOLOv8n-seg person detection + instance segmentation + tailgating check
       → Log to SQLite
 ```
 
@@ -162,28 +174,32 @@ Frame → CLAHE → MOG2 motion gate → HOG face detect
 
 ```
 smart_access_control/
-├── app.py                      # All seven pages and pipeline orchestration
+├── app.py                      # All eight pages and pipeline orchestration
 ├── requirements.txt
-├── yolov8n.pt                  # YOLOv8n weights (COCO-pretrained, ~6 MB)
 ├── modules/
-│   ├── anti_spoofing.py        # EAR blink detection, LBP texture, Laplacian sharpness
-│   ├── background_model.py     # CLAHE + MOG2 + morphological cleanup
+│   ├── anti_spoofing.py        # EAR blink, LBP texture, Laplacian, temporal, DCT replay checks
+│   ├── background_model.py     # CLAHE + MOG2 + apply_morphology() (closing + dilation)
 │   ├── database.py             # SQLite CRUD — users, blacklist, access_log tables
 │   ├── face_recognizer.py      # HOG detect + ResNet embed + blacklist check + 1-vs-1 verify
-│   ├── feature_extractor.py    # Face alignment, Canny, LBP, HOG → feature vector
+│   ├── feature_extractor.py    # Face alignment, Canny edge, LBP texture, HOG → feature vector
 │   ├── knn_engine.py           # KNN train/predict on Canny+LBP+HOG features (custom data)
-│   ├── person_tracker.py       # YOLOv8n + ByteTrack tailgating detection
+│   ├── person_tracker.py       # YOLOv8n-seg — person detection + instance segmentation masks
 │   ├── rbac_engine.py          # ALLOW / DENY / ALERT role-based decisions
-│   └── utils.py                # OpenCV annotation helpers
+│   └── utils.py                # OpenCV annotation helpers (draws seg masks, landmarks, badges)
 ├── database/
 │   └── access_control.db       # SQLite database (auto-created on first run)
 ├── known_faces/<username>/     # Enrolled face images (auto-created on enrolment)
-└── models/
-    ├── knn_classifier.pkl      # Trained KNN (auto-generated after enrolment)
-    └── label_encoder.pkl       # Label encoder (auto-generated after enrolment)
+├── models/
+│   ├── knn_classifier.pkl      # Trained KNN (auto-generated after enrolment)
+│   └── label_encoder.pkl       # Label encoder (auto-generated after enrolment)
+└── test/
+    ├── image_detection/        # Sample images for Identify: Image testing
+    ├── spoof_samples/          # Sample images for anti-spoofing testing
+    └── tailgating_samples/     # Sample images for tailgating detection testing
 ```
 
-> `database/`, `known_faces/`, and `models/` are created automatically. You do not need to create them manually.
+> `database/`, `known_faces/`, and `models/` are created automatically. You do not need to create them manually.  
+> YOLOv8n-seg weights (`yolov8n-seg.pt`) are downloaded automatically by Ultralytics on first use.
 
 ---
 
@@ -195,8 +211,8 @@ smart_access_control/
 | dlib ResNet-34 | Pre-trained | `face_recognition_models` | 128-d face embedding (LFW 99.38%) |
 | dlib shape predictor | Pre-trained | `face_recognition_models` | 68 facial landmark keypoints |
 | KNN Classifier | **Trained on custom data** | scikit-learn, trained at runtime | Secondary identity verification (Canny+LBP+HOG features) |
-| YOLOv8n | Pre-trained (COCO) | Ultralytics | Person detection; tailgating = `len > 1` |
-| MOG2 | Statistical model | OpenCV | Background subtraction, motion gating |
+| YOLOv8n-seg | Pre-trained (COCO) | Ultralytics | Person detection + instance segmentation; tailgating = `len > 1` |
+| MOG2 | Statistical model | OpenCV | Background subtraction + motion gating |
 
 The **KNN classifier** is the project's custom-trained model: it is fitted from scratch on Canny+LBP+HOG feature vectors extracted from each enrolled user's face images. It retrains automatically on every new enrolment.
 
@@ -207,11 +223,11 @@ The **KNN classifier** is the project's custom-trained model: it is fitted from 
 | Library | Version | Purpose |
 |---|---|---|
 | `streamlit` | ≥1.32 | Web interface and camera fragment |
-| `opencv-python` | ≥4.9 | CLAHE, MOG2, morphology, drawing |
+| `opencv-python` | ≥4.9 | CLAHE, MOG2, morphology, Canny, drawing |
 | `face-recognition` | ≥1.3 | dlib HOG detector + ResNet embeddings |
 | `numpy` | ≥1.24 | Array operations |
 | `scikit-learn` | ≥1.4 | KNN classifier |
-| `scikit-image` | ≥0.21 | LBP texture descriptor |
-| `ultralytics` | ≥8.1 | YOLOv8n + ByteTrack |
+| `scikit-image` | ≥0.21 | LBP texture descriptor, HOG visualisation |
+| `ultralytics` | ≥8.1 | YOLOv8n-seg detection + segmentation |
 | `Pillow` | ≥10.2 | Image decode for uploads |
-| `pandas` | ≥2.1 | Access log display |
+| `pandas` | ≥2.1 | Access log and benchmark results display |
