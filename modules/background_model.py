@@ -78,6 +78,31 @@ def apply_clahe(frame_bgr):
     return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
 
 
+# ── Binary morphological operations ──────────────────────────────────────────
+
+def apply_morphology(mask: np.ndarray) -> np.ndarray:
+    """
+    Apply binary morphological operations to a foreground mask.
+
+    Two-stage pipeline:
+      1. Morphological closing (dilation then erosion with an elliptic kernel)
+         fills small holes and gaps inside a detected moving object so that
+         a person's torso is not split into disconnected blobs.
+      2. Dilation (two iterations) expands the remaining blobs outward, merging
+         nearby foreground regions that belong to the same physical object.
+
+    Args:
+        mask: Binary uint8 mask (0 / 255) from MOG2 threshold.
+
+    Returns:
+        Cleaned binary mask of the same shape and dtype.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask   = cv2.dilate(mask, kernel, iterations=2)
+    return mask
+
+
 # ── Motion detection ──────────────────────────────────────────────────────────
 
 def detect_motion(frame_bgr, min_contour_area=2000):
@@ -101,11 +126,7 @@ def detect_motion(frame_bgr, min_contour_area=2000):
     # confirmed foreground pixels (value=255).
     _, fg_mask = cv2.threshold(raw_mask, 200, 255, cv2.THRESH_BINARY)
 
-    # Morphological close fills small gaps within a moving object, then dilation
-    # merges nearby blobs that belong to the same person/object.
-    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
-    fg_mask = cv2.dilate(fg_mask, kernel, iterations=2)
+    fg_mask = apply_morphology(fg_mask)
 
     contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     regions = [

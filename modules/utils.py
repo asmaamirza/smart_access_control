@@ -96,6 +96,17 @@ def draw_spoof_badge(frame_bgr: np.ndarray, face: dict, spoof: dict) -> None:
 def draw_person_tracks(frame_bgr: np.ndarray,
                        persons: list[dict], tailgating: bool) -> None:
     color = RED if tailgating else ORANGE
+
+    # Draw segmentation masks as a semi-transparent fill (image segmentation).
+    # mask_poly contains polygon vertices in original image coordinates returned
+    # by YOLOv8n-seg — no resize required.
+    polys = [p["mask_poly"] for p in persons if "mask_poly" in p]
+    if polys:
+        overlay = frame_bgr.copy()
+        for poly in polys:
+            cv2.fillPoly(overlay, [poly], color)
+        cv2.addWeighted(overlay, 0.35, frame_bgr, 0.65, 0, frame_bgr)
+
     for i, p in enumerate(persons, 1):
         cv2.rectangle(frame_bgr, (p["x1"], p["y1"]), (p["x2"], p["y2"]), color, 2)
         cv2.putText(frame_bgr, f"Person {i}",
