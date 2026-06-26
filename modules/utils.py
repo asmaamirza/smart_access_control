@@ -152,3 +152,56 @@ def stamp_ear(frame_bgr: np.ndarray, ear: float,
                 f"EAR:{ear:.2f}  Blinks:{blink_count}  "
                 f"{'LIVE ✓' if liveness_ok else 'Waiting for blink…'}",
                 (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
+
+
+def draw_scanning_bar(
+    frame_bgr: np.ndarray,
+    scan_frame: int,
+    total_frames: int = 25,
+    face_box: "dict | None" = None,
+) -> None:
+    """
+    Neon green scanning bar that sweeps top-to-bottom for the terminal scan animation.
+    Uses two alpha-blended passes to produce a glow effect.
+    """
+    h, w  = frame_bgr.shape[:2]
+    color = (0, 255, 120)   # neon green (BGR)
+
+    # Scan region — face box with padding, or full frame
+    if face_box:
+        pad = 20
+        y0 = max(0, face_box["top"]    - pad)
+        y1 = min(h, face_box["bottom"] + pad)
+        x0 = max(0, face_box["left"]   - pad)
+        x1 = min(w, face_box["right"]  + pad)
+    else:
+        y0, y1, x0, x1 = 0, h, 0, w
+
+    # Linear sweep top-to-bottom
+    t     = (scan_frame % total_frames) / max(total_frames - 1, 1)
+    bar_y = y0 + int(t * (y1 - y0))
+    bar_h = max(4, (y1 - y0) // 12)
+
+    # Wide glow layer (low opacity)
+    overlay = frame_bgr.copy()
+    cv2.rectangle(overlay,
+                  (x0, max(y0, bar_y - bar_h * 2)),
+                  (x1, min(y1, bar_y + bar_h * 2)),
+                  color, -1)
+    cv2.addWeighted(overlay, 0.18, frame_bgr, 0.82, 0, frame_bgr)
+
+    # Core bright bar (higher opacity)
+    overlay = frame_bgr.copy()
+    cv2.rectangle(overlay,
+                  (x0, max(y0, bar_y - bar_h // 2)),
+                  (x1, min(y1, bar_y + bar_h // 2)),
+                  color, -1)
+    cv2.addWeighted(overlay, 0.55, frame_bgr, 0.45, 0, frame_bgr)
+
+    # "SCANNING..." text
+    txt = "SCANNING..."
+    (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+    tx = (w - tw) // 2
+    ty = (y0 - 8) if y0 > th + 8 else min(h - 4, y1 + th + 8)
+    cv2.putText(frame_bgr, txt, (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)

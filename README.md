@@ -95,10 +95,15 @@ Overview of the full vision pipeline, all roles, and quick-start guide.
 
 ### Security Terminal *(two-factor authentication)*
 1. Enter your **username** and **password** — credentials are verified first.
-2. If valid, the webcam activates for **face verification** against your enrolled encoding (1-vs-1 match, not a database scan).
-3. **Blink once** to confirm liveness (EAR blink detection).
-4. System runs the blacklist check on your face first — a blacklisted individual using stolen credentials is caught here.
-5. Result: **ACCESS GRANTED** (green) or **SECURITY ALERT / ACCESS DENIED** (red).
+2. If valid, the webcam opens and waits for a **stable face** (hold still for 3 consecutive frames).
+3. While stable, **YOLO tailgating check** runs every 5 frames — if more than one person is detected, access is immediately denied and logged with `tailgating=True`.
+4. **Blacklist check** runs first on the detected face encoding — a blacklisted individual using stolen credentials is caught here.
+5. **Blink once** to confirm liveness (EAR blink detection).
+6. **Anti-spoofing** runs: static texture (LBP) + sharpness (Laplacian) + temporal motion check + DCT replay artifact check.
+7. **1-vs-1 face verification** against the claimed username's stored encoding.
+8. Result: **ACCESS GRANTED** (green) or **SECURITY ALERT / ACCESS DENIED** (red).
+
+> **Camera quality toggle:** ON = normal anti-spoofing thresholds. OFF = relaxed thresholds with a warning banner (use for low-resolution or poor-lighting cameras).
 
 ### Register User
 Three tabs:
@@ -116,6 +121,8 @@ Upload a JPG/PNG and run the full pipeline in one click:
 - CLAHE → HOG detection → ResNet matching → anti-spoofing → RBAC decision → YOLOv8n-seg tailgating
 - Shows annotated result, access decision, KNN secondary verification, and intermediate CV outputs (Canny edge map, LBP texture, HOG gradients)
 - Expandable **Background model** panel showing the MOG2 foreground mask after morphological operations
+- Expandable **Test samples** panel — browse images from `test/image_detection/`, `test/spoof_samples/`, and `test/tailgating_samples/` directly in the UI
+- **Camera quality toggle:** replaces the old security mode slider — maps to normal (ON) or relaxed (OFF) thresholds
 
 ### Identify: Video *(third input modality)*
 Upload a video file (MP4, AVI, MOV, MKV) and run the full pipeline on sampled frames:
@@ -125,11 +132,13 @@ Upload a video file (MP4, AVI, MOV, MKV) and run the full pipeline on sampled fr
 
 ### Live Camera
 Real-time webcam feed with full pipeline:
-- Start/Stop controls, security mode toggle, landmark toggle
-- Frame-skip sliders for face recognition and YOLO intervals
-- Live FPS counter, blink counter, and pipeline stage indicator
-- Tailgating alert when more than one person is tracked simultaneously
-- Person segmentation masks drawn as semi-transparent overlays
+- **Start works on first click** — camera initialises cleanly via forced rerun
+- **High quality camera toggle** replaces old security mode slider — ON = normal thresholds, OFF = relaxed with warning banner
+- Frame-skip sliders for face recognition interval and YOLO interval
+- **Stability gate** — shows "HOLD STILL" overlay until face is stable for 3 consecutive frames before running recognition
+- Live FPS counter, blink counter, spoof status (`LIVE` / `WAITING FOR BLINK` / `SPOOF SUSPECTED`), and pipeline stage log (`computed` / `cached` / `skipped`)
+- Tailgating alert when more than one person is detected
+- CLAHE cached every 4 frames; face recognition and YOLO run at configurable intervals to reduce per-frame CPU load
 
 ### Admin Panel
 - View system stats (total users, ALLOW/DENY/ALERT counts)
@@ -143,29 +152,61 @@ Searchable, filterable table of every access event with timestamp, name, role, c
 
 ---
 
-## Security Modes
+## Camera Quality Toggle
 
-| Mode | Max Distance | Min Confidence | Use Case |
-|---|---|---|---|
-| Strict | 0.50 | 40% | High-security environments |
-| Normal | 0.60 | 25% | Standard operation |
-| Relaxed | 0.70 | 12% | Demo / low-risk |
+The security mode slider has been replaced with a **High quality camera** toggle present on Live Camera, Security Terminal, and Identify Image pages.
+
+| Toggle | Security Mode | Anti-Spoofing Behaviour |
+|---|---|---|
+| ON (default) | Normal | LBP + Laplacian + blink + temporal motion + DCT replay all active |
+| OFF | Relaxed | Blink required; static checks advisory; warning banner shown |
+
+The underlying face recognition distance thresholds are unchanged:
+
+| Mode | Max Distance | Min Confidence |
+|---|---|---|
+| Normal | 0.60 | 25% |
+| Relaxed | 0.70 | 12% |
 
 ---
 
-## Pipeline Order (all modes)
+## Pipeline Order
 
+### Live Camera / Identify Image
 ```
-Frame → CLAHE enhancement
-      → MOG2 background subtraction → apply_morphology() → motion regions
+Frame → CLAHE (cached every 4 frames in live mode)
+      → MOG2 background subtraction → morphological close+dilate → motion regions
+      → Stability gate — skip recognition if face is moving (live mode only)
       → HOG face detection → 68-point landmark extraction
       → BLACKLIST CHECK FIRST (0.50 threshold, always strict)
          ↳ Match → ALERT + stop
-         ↳ No match → ResNet 1-vs-1 verify (Terminal) or full-DB search (Live/Image)
-      → Anti-spoofing (EAR blink + LBP texture + Laplacian + temporal + DCT replay)
+         ↳ No match → ResNet full-DB search
+      → Anti-spoofing:
+         • EAR blink (BlinkTracker)
+         • LBP texture variance
+         • Laplacian sharpness
+         • Temporal motion check (frame-to-frame pixel diff)
+         • DCT replay artifact check
+         • aggregate_spoof_result() → final LIVE / SPOOF SUSPECTED verdict
       → RBAC decision (ALLOW / DENY / ALERT)
-      → YOLOv8n-seg person detection + instance segmentation + tailgating check
+      → YOLOv8n person detection + tailgating check (every 5 frames in live mode)
       → Log to SQLite
+```
+
+### Security Terminal
+```
+Credentials (username + password) → verify_credentials()
+      → Webcam open → wait for stable face (3 consecutive stable frames)
+      → YOLO tailgating check (every 5 frames)
+         ↳ Tailgating → DENY + log tailgating=True + stop
+      → BLACKLIST CHECK FIRST
+         ↳ Match → ALERT + stop
+      → Blink liveness gate
+         ↳ Not passed → "BLINK ONCE" + continue scanning
+      → Full spoof check (static + temporal + DCT)
+         ↳ Fail → DENY + stop
+      → ResNet 1-vs-1 verify against claimed username
+      → RBAC decision → log → result page
 ```
 
 ---

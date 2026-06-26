@@ -29,6 +29,11 @@ KNN_PATH        = os.path.join(MODELS_DIR, "knn_classifier.pkl")
 ENCODER_PATH    = os.path.join(MODELS_DIR, "label_encoder.pkl")
 KNOWN_FACES_DIR = "known_faces"
 
+# Minimum confidence for a KNN prediction to be considered reliable.
+# Predictions below this threshold are returned as (None, raw_conf) so callers
+# display "Unknown / Low confidence" instead of a potentially wrong username.
+KNN_CONFIDENCE_THRESHOLD = 0.45
+
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
@@ -129,6 +134,11 @@ def predict_knn(feature_vector: np.ndarray) -> tuple[str | None, float]:
         idx   = int(np.argmax(proba))
         conf  = float(proba[idx])
         name  = le.inverse_transform([idx])[0]
+
+        # Reject low-confidence predictions to avoid confidently wrong output.
+        # Return None so callers display "Unknown" rather than a wrong username.
+        if conf < KNN_CONFIDENCE_THRESHOLD:
+            return None, conf
         return name, conf
     except Exception:
         return None, 0.0
@@ -142,17 +152,27 @@ def knn_is_ready() -> bool:
 def knn_info() -> dict:
     """Return basic stats about the saved model for display in the UI."""
     if not knn_is_ready():
-        return {"ready": False, "n_samples": 0, "n_classes": 0, "k": 0}
+        return {"ready": False, "n_samples": 0, "n_classes": 0, "k": 0,
+                "threshold": KNN_CONFIDENCE_THRESHOLD, "low_sample_warning": False}
     try:
         with open(KNN_PATH,     "rb") as f:
             knn = pickle.load(f)
         with open(ENCODER_PATH, "rb") as f:
             le  = pickle.load(f)
+        y_enc          = knn._y
+        n_samples      = len(knn._fit_X)
+        n_classes      = len(le.classes_)
+        counts_per_cls = [int(np.sum(y_enc == i)) for i in range(n_classes)]
+        low_sample     = any(c < 3 for c in counts_per_cls)
         return {
-            "ready":     True,
-            "n_samples": len(knn._fit_X),
-            "n_classes": len(le.classes_),
-            "k":         knn.n_neighbors,
+            "ready":              True,
+            "n_samples":          n_samples,
+            "n_classes":          n_classes,
+            "k":                  knn.n_neighbors,
+            "threshold":          KNN_CONFIDENCE_THRESHOLD,
+            "low_sample_warning": low_sample,
+            "samples_per_class":  counts_per_cls,
         }
     except Exception:
-        return {"ready": False, "n_samples": 0, "n_classes": 0, "k": 0}
+        return {"ready": False, "n_samples": 0, "n_classes": 0, "k": 0,
+                "threshold": KNN_CONFIDENCE_THRESHOLD, "low_sample_warning": False}
