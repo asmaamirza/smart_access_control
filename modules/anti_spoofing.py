@@ -167,7 +167,7 @@ def temporal_spoof_check(
     result["motion_score"] = round(motion_score, 3)
 
     # Below this level the face is suspiciously static (printed / paused replay)
-    static_thresh = {"strict": 1.5, "normal": 1.0, "relaxed": 0.5}.get(security_mode, 1.0)
+    static_thresh = {"normal": 1.0, "relaxed": 0.5}.get(security_mode, 1.0)
     result["suspicious_static"] = motion_score < static_thresh
     result["motion_ok"] = not result["suspicious_static"]
 
@@ -216,9 +216,8 @@ def aggregate_spoof_result(
     """
     Combine all spoof signals (static, blink, temporal, replay) into one verdict.
 
-    strict:  blink + texture + laplacian + temporal motion + frequency all required
-    normal:  blink + texture + laplacian required; temporal/replay used to downgrade
-    relaxed: blink required; static checks advisory; temporal only for full statics
+    normal:  blink + texture + laplacian required; temporal used to downgrade suspicious statics
+    relaxed: blink required; static checks advisory; completely static frames still denied
     """
     tex_ok      = static_result.get("texture_ok",   True)
     lap_ok      = static_result.get("laplacian_ok", True)
@@ -226,9 +225,7 @@ def aggregate_spoof_result(
     motion_ok   = (temporal_result or {}).get("motion_ok",   True)
     freq_ok     = (replay_result   or {}).get("freq_ok",     True)
 
-    if security_mode == "strict":
-        is_live = blink_passed and tex_ok and lap_ok and motion_ok and freq_ok
-    elif security_mode == "relaxed":
+    if security_mode == "relaxed":
         is_live = blink_passed
         if susp_static and not motion_ok:   # even relaxed catches completely static frames
             is_live = False

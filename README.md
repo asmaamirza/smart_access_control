@@ -124,12 +124,6 @@ Upload a JPG/PNG and run the full pipeline in one click:
 - Expandable **Test samples** panel — browse images from `test/image_detection/`, `test/spoof_samples/`, and `test/tailgating_samples/` directly in the UI
 - **Camera quality toggle:** replaces the old security mode slider — maps to normal (ON) or relaxed (OFF) thresholds
 
-### Identify: Video *(third input modality)*
-Upload a video file (MP4, AVI, MOV, MKV) and run the full pipeline on sampled frames:
-- Configurable frame stride (process every N frames) for speed control
-- Displays summary stats: frames granted / denied / tailgating count
-- Shows a grid of up to 8 annotated sample frames with per-frame verdict labels
-
 ### Live Camera
 Real-time webcam feed with full pipeline:
 - **Start works on first click** — camera initialises cleanly via forced rerun
@@ -148,7 +142,7 @@ Real-time webcam feed with full pipeline:
 - **Benchmark** — runs ResNet + KNN recognition on every enrolled image and reports top-1 accuracy, average confidence, and per-frame latency
 
 ### Access Log
-Searchable, filterable table of every access event with timestamp, name, role, confidence, action, and source (image / video / live / terminal).
+Searchable, filterable table of every access event with timestamp, name, role, confidence, action, and source (image / live / terminal).
 
 ---
 

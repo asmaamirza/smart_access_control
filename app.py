@@ -3,7 +3,6 @@ Smart Access Control System — CSCI435 Project
 Entry point: streamlit run app.py
 """
 
-import logging
 import os
 import shutil
 import secrets
@@ -48,27 +47,13 @@ STABILITY_SCALE_THRESHOLD    = 0.15  # max fractional change in face box height
 
 # ── Security Terminal frame-interval constants ─────────────────────────────────
 TERMINAL_FACE_DETECT_INTERVAL = 2    # HOG face detection every N frames (pre-scan)
-TERMINAL_LANDMARK_INTERVAL    = 1    # landmark refresh interval (reference; done every frame)
-TERMINAL_YOLO_INTERVAL        = 5    # reference only — YOLO runs only after blink confirmed
 TERMINAL_SCAN_FRAMES          = 25   # scanning animation frames before backend checks
 
 # ── Test sample directories ───────────────────────────────────────────────────
 TEST_DIR          = "test"
 TEST_IMAGE_DIR    = os.path.join(TEST_DIR, "image_detection")
-TEST_LIVE_DIR     = os.path.join(TEST_DIR, "live_camera")
 TEST_SPOOF_DIR    = os.path.join(TEST_DIR, "spoof_samples")
 TEST_TAILGATE_DIR = os.path.join(TEST_DIR, "tailgating_samples")
-
-# ── Structured logging ────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.WARNING,
-                    format="%(levelname)s | SmartAccess | %(message)s")
-_LOG = logging.getLogger("SmartAccess")
-
-
-def _log_info(msg: str):    _LOG.info(msg)
-def _log_warning(msg: str): _LOG.warning(msg)
-def _log_error(msg: str):   _LOG.error(msg)
-
 
 _SPOOF_FALLBACK = {
     "is_live": True, "texture_ok": True, "laplacian_ok": True,
@@ -83,7 +68,7 @@ _CLAHE_EVERY = 4   # reuse enhanced frame for this many frames before recomputin
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 init_db()
 os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
-for _d in (TEST_IMAGE_DIR, TEST_LIVE_DIR, TEST_SPOOF_DIR, TEST_TAILGATE_DIR):
+for _d in (TEST_IMAGE_DIR, TEST_SPOOF_DIR, TEST_TAILGATE_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # ── Page config ───────────────────────────────────────────────────────────────

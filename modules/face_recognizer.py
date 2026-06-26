@@ -27,7 +27,6 @@ _NORM_DIST = 0.80
 
 # Per-mode maximum acceptable distance (maps to the RBAC threshold in rbac_engine)
 _DIST_THRESH = {
-    "strict":  0.50,
     "normal":  0.60,
     "relaxed": 0.70,
 }

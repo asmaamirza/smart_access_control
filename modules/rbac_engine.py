@@ -16,13 +16,11 @@ blacklist table, not valid system users.
 
 Security modes — adjustable confidence threshold
 ------------------------------------------------
-strict   ≥ 0.40  (high-security; guards against impersonation)
 normal   ≥ 0.25  (standard operation)
 relaxed  ≥ 0.12  (permissive; demo / low-risk environments)
 """
 
 THRESHOLDS = {
-    "strict":  0.40,
     "normal":  0.25,
     "relaxed": 0.12,
 }
@@ -52,7 +50,7 @@ def make_decision(match: dict | None, confidence: float,
         match:          User dict from the database (or None if unrecognised).
         confidence:     Float in [0, 1] — higher is more certain.
         spoof_passed:   False if anti-spoofing flagged this face as fake.
-        security_mode:  'strict', 'normal', or 'relaxed'.
+        security_mode:  'normal' or 'relaxed'.
 
     Returns dict:
         action   — 'ALLOW', 'DENY', or 'ALERT'
