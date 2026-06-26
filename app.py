@@ -36,7 +36,7 @@ from modules.person_tracker    import detect_and_track, reset_tracker
 from modules.rbac_engine       import make_blacklist_decision, make_decision, ROLE_COLORS
 from modules.utils             import (
     draw_landmarks, draw_motion_regions, draw_person_tracks,
-    draw_rbac_result, draw_spoof_badge, stamp_ear, stamp_status,
+    draw_rbac_result, draw_scanning_bar, draw_spoof_badge, stamp_ear, stamp_status,
 )
 
 KNOWN_FACES_DIR = "known_faces"
@@ -45,6 +45,12 @@ KNOWN_FACES_DIR = "known_faces"
 STABILITY_MOVEMENT_THRESHOLD = 12    # max center-pixel displacement between frames
 STABILITY_REQUIRED_FRAMES    = 3     # consecutive stable frames before proceeding
 STABILITY_SCALE_THRESHOLD    = 0.15  # max fractional change in face box height
+
+# ── Security Terminal frame-interval constants ─────────────────────────────────
+TERMINAL_FACE_DETECT_INTERVAL = 2    # HOG face detection every N frames (pre-scan)
+TERMINAL_LANDMARK_INTERVAL    = 1    # landmark refresh interval (reference; done every frame)
+TERMINAL_YOLO_INTERVAL        = 5    # reference only — YOLO runs only after blink confirmed
+TERMINAL_SCAN_FRAMES          = 25   # scanning animation frames before backend checks
 
 # ── Test sample directories ───────────────────────────────────────────────────
 TEST_DIR          = "test"
@@ -103,7 +109,6 @@ _NAV_ITEMS = [
     ("Security Terminal", ":material/fingerprint:"),
     ("Register User",     ":material/person_add:"),
     ("Identify: Image",   ":material/image_search:"),
-    ("Identify: Video",   ":material/video_file:"),
     ("Live Camera",       ":material/videocam:"),
     ("Admin Panel",       ":material/admin_panel_settings:"),
     ("Access Log",        ":material/assignment:"),
@@ -413,25 +418,9 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
                         False, security_mode,
                     )
 
-        for face, decision in zip(faces, decisions):
-            if face.get("blacklisted"):
-                log_access_event(
-                    detected_name=decision.get("name", "Unknown"),
-                    username="", role="blacklisted",
-                    confidence=face.get("blacklist_confidence", 0.0),
-                    action="ALERT", reason=decision.get("reason", ""),
-                    tailgating=False, source="live",
-                )
-            else:
-                log_access_event(
-                    detected_name=decision.get("name", "Unknown"),
-                    username=decision.get("username", ""),
-                    role=decision.get("role", "unknown"),
-                    confidence=face["confidence"],
-                    action=decision["action"],
-                    reason=decision.get("reason", ""),
-                    tailgating=False, source="live",
-                )
+        # Live Camera is testing-only — access events are NOT logged here.
+        # Logging happens only in Security Terminal (source="terminal") and
+        # Identify Image (source="image").
 
         cache.update({"faces": faces, "decisions": decisions,
                       "spoofs": spoofs, "all_lm": all_lm,
@@ -699,10 +688,15 @@ def _live_camera_loop():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TERMINAL PIPELINE — targeted MFA verification for Security Terminal
+# TERMINAL PIPELINE — state-machine MFA verification for Security Terminal
 #
-# Order: YOLO tailgating → face detection → stability gate → blacklist →
-#        blink liveness → spoof (static + temporal + replay) → identity
+# State flow:
+#   credentials → waiting_for_face → hold_still → blink_required →
+#   scanning_animation → backend_checks → (tailgating | spoof | blacklist |
+#                                          identity_mismatch | complete)
+#
+# Heavy operations (YOLO, full spoof, encoding, identity) only run after the
+# user is stable AND has blinked, keeping every pre-scan frame lightweight.
 # ═══════════════════════════════════════════════════════════════════════════════
 def _run_terminal_pipeline(frame_bgr: np.ndarray,
                            claimed_username: str,
@@ -710,171 +704,199 @@ def _run_terminal_pipeline(frame_bgr: np.ndarray,
                            blink_tracker,
                            cache: dict) -> tuple:
     """
-    Security Terminal pipeline.
-
     Returns (annotated_frame, decision_or_None, spoof_or_None, tailgating, status_msg)
-      decision is non-None only for a definitive outcome (ALLOW / ALERT / tailgating DENY).
-      status_msg: 'NO FACE' | 'HOLD STILL' | 'TAILGATING' | 'BLINK REQUIRED' |
-                  'SPOOF' | 'BLACKLISTED' | 'SCANNING' | 'COMPLETE'
-    """
-    frame_n    = cache.get("frame_n", 0)
-    run_recog  = frame_n % 2 == 0
-    yolo_every = 5
-    result     = frame_bgr.copy()
 
-    S          = 1.0 / _PROC_SCALE
+    status_msg values:
+      'NO FACE' | 'HOLD STILL' | 'BLINK REQUIRED' | 'SCANNING' |
+      'TAILGATING' | 'SPOOF' | 'BLACKLISTED' | 'COMPLETE'
+    """
+    frame_n = cache.get("frame_n", 0)
+    result  = frame_bgr.copy()
+    S       = 1.0 / _PROC_SCALE
+
+    # ══ Phase A: Scanning animation ════════════════════════════════════════════
+    # Runs for TERMINAL_SCAN_FRAMES frames after blink is confirmed.
+    # No heavy processing — just draw the animation over the cached frame state.
+    if cache.get("scan_started") and cache.get("scan_frame", 0) < TERMINAL_SCAN_FRAMES:
+        sf = cache.get("scan_frame", 0)
+        draw_scanning_bar(result, sf, TERMINAL_SCAN_FRAMES, cache.get("last_face_box"))
+        draw_person_tracks(result, cache.get("persons", []), cache.get("tailgating", False))
+        stamp_status(result, "SCANNING...", (0, 255, 120))
+        cache.update({"scan_frame": sf + 1, "frame_n": frame_n + 1,
+                      "pipeline_stage": "scanning_animation"})
+        return result, None, None, cache.get("tailgating", False), "SCANNING"
+
+    # ══ Phase B: Backend checks (runs once after animation completes) ══════════
+    if cache.get("scan_started") and cache.get("scan_frame", 0) >= TERMINAL_SCAN_FRAMES:
+        face_box = cache.get("last_face_box")
+        cache["pipeline_stage"] = "backend_checks"
+
+        # B1 — YOLO tailgating (single run)
+        if not cache.get("yolo_done"):
+            persons, tailgating = detect_and_track(result)
+            cache.update({"persons": persons, "tailgating": tailgating, "yolo_done": True})
+        persons    = cache.get("persons",    [])
+        tailgating = cache.get("tailgating", False)
+        draw_person_tracks(result, persons, tailgating)
+
+        if tailgating:
+            tg = {"action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+                  "label": "Tailgating — multiple persons in frame",
+                  "reason": "Multiple persons detected in access zone",
+                  "name": "", "username": ""}
+            if face_box:
+                draw_rbac_result(result, face_box, tg)
+            stamp_status(result, "TAILGATING ALERT", (0, 0, 220))
+            cache.update({"frame_n": frame_n + 1, "pipeline_stage": "tailgating_alert"})
+            return result, None, None, True, "TAILGATING"
+
+        # B2 — Anti-spoofing (static + temporal + replay)
+        lm_s = cache.get("last_lm_s", {})
+        gray = None
+        if face_box:
+            roi = frame_bgr[face_box["top"]:face_box["bottom"],
+                            face_box["left"]:face_box["right"]]
+            if roi.size > 0:
+                gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (64, 64))
+        spoof = static_spoof_check(gray, lm_s) if gray is not None else dict(_SPOOF_FALLBACK)
+        if gray is not None:
+            spoof = aggregate_spoof_result(
+                spoof, True,
+                temporal_spoof_check(cache.get("prev_gray_face"), gray, cache, security_mode),
+                replay_artifact_check(gray),
+                security_mode,
+            )
+        if not spoof.get("is_live", True):
+            sd = {"action": "DENY", "role": "spoof", "color": ROLE_COLORS["spoof"],
+                  "label": f"Anti-spoofing failed — {spoof.get('status', 'SPOOF SUSPECTED')}",
+                  "reason": "Possible replay/print attack", "name": "", "username": ""}
+            if face_box:
+                draw_rbac_result(result, face_box, sd)
+            stamp_status(result, "SPOOF SUSPECTED", (0, 80, 255))
+            cache.update({"frame_n": frame_n + 1, "pipeline_stage": "spoof_rejected"})
+            return result, sd, spoof, tailgating, "SPOOF"
+
+        # B3 — Blacklist check + identity verification
+        enc_s = cache.get("last_enc_s")
+        if enc_s is not None:
+            is_bl, bl_entry, _ = check_blacklist(enc_s)
+            if is_bl:
+                dec = make_blacklist_decision(bl_entry)
+                if face_box:
+                    draw_rbac_result(result, face_box, dec)
+                stamp_status(result, "SECURITY ALERT", (0, 0, 220))
+                cache.update({"frame_n": frame_n + 1, "pipeline_stage": "blacklist_alert"})
+                return result, dec, spoof, tailgating, "BLACKLISTED"
+
+            match, conf = verify_claimed_user(enc_s, claimed_username, security_mode)
+            cache.update({"last_match": match, "last_confidence": conf if match else 0.0})
+            if match:
+                dec = make_decision(match, conf, True, security_mode)
+            else:
+                dec = {"action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+                       "label": f"Identity not verified ({conf:.0%})",
+                       "reason": "Face does not match claimed user", "name": "", "username": ""}
+        else:
+            dec = {"action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+                   "label": "No face encoding available",
+                   "reason": "Feature extraction failed", "name": "", "username": ""}
+
+        if face_box:
+            draw_rbac_result(result, face_box, dec)
+        granted = dec["action"] == "ALLOW"
+        stamp_status(result,
+                     "ACCESS GRANTED" if granted else "ACCESS DENIED",
+                     (0, 200, 0) if granted else (0, 0, 220))
+        cache.update({"frame_n": frame_n + 1, "pipeline_stage": "complete"})
+        return result, dec, spoof, tailgating, "COMPLETE"
+
+    # ══ Phase C: Pre-scan — lightweight per-frame processing ══════════════════
+    # Goal: minimise lag before the scan starts.
+    #   • HOG face detection: every TERMINAL_FACE_DETECT_INTERVAL frames
+    #   • Landmarks + EAR:    every frame using cached face locations (cheap)
+    #   • Face encoding:      once, when face first becomes stable
+    #   • YOLO:               deferred to Phase B (post-blink)
+    cache["pipeline_stage"] = "pre_scan"
     small      = cv2.resize(frame_bgr, (0, 0), fx=_PROC_SCALE, fy=_PROC_SCALE)
     enhanced_s = apply_clahe(small)
     rgb_s      = cv2.cvtColor(enhanced_s, cv2.COLOR_BGR2RGB)
 
-    # ── YOLO tailgating (every yolo_every frames) ─────────────────────────────
-    if frame_n % yolo_every == 0:
-        persons, tailgating = detect_and_track(result)
-        cache["persons"]    = persons
-        cache["tailgating"] = tailgating
+    run_face = (frame_n % TERMINAL_FACE_DETECT_INTERVAL == 0) or ("last_face_locs_s" not in cache)
+    if run_face:
+        face_locs_s = face_recognition.face_locations(rgb_s, model="hog")
+        cache["last_face_locs_s"] = face_locs_s
     else:
-        persons    = cache.get("persons",    [])
-        tailgating = cache.get("tailgating", False)
-    draw_person_tracks(result, persons, tailgating)
+        face_locs_s = cache.get("last_face_locs_s", [])
 
-    # ── Face detection ────────────────────────────────────────────────────────
-    face_locs_s = face_recognition.face_locations(rgb_s, model="hog")
     if not face_locs_s:
-        cache["frame_n"]      = frame_n + 1
-        cache["stable_count"] = 0
+        cache.pop("last_face_box", None)
+        cache.update({"stable_count": 0, "is_stable": False,
+                      "pipeline_stage": "waiting_for_face", "frame_n": frame_n + 1})
         stamp_status(result, "NO FACE DETECTED", (160, 160, 160))
-        return result, None, None, tailgating, "NO FACE"
+        return result, None, None, False, "NO FACE"
 
-    face_enc_s = face_recognition.face_encodings(rgb_s, face_locs_s)
-    all_lm_s   = face_recognition.face_landmarks(rgb_s, face_locs_s)
+    # Update stability on face-detect frames
+    if run_face:
+        loc_s    = face_locs_s[0]
+        face_box = {"top":    int(loc_s[0] * S), "right": int(loc_s[1] * S),
+                    "bottom": int(loc_s[2] * S), "left":  int(loc_s[3] * S)}
+        ok = compute_face_stability(cache.get("last_face_box"), face_box)
+        cache["last_face_box"] = face_box
+        cache["stable_count"]  = (cache.get("stable_count", 0) + 1) if ok else 0
+        cache["is_stable"]     = cache["stable_count"] >= STABILITY_REQUIRED_FRAMES
+    else:
+        face_box = cache.get("last_face_box")
+        if face_box is None:
+            cache.update({"frame_n": frame_n + 1})
+            stamp_status(result, "NO FACE DETECTED", (160, 160, 160))
+            return result, None, None, False, "NO FACE"
 
-    enc_s = face_enc_s[0]
-    lm_s  = all_lm_s[0] if all_lm_s else {}
-    loc_s = face_locs_s[0]
-    top_f  = int(loc_s[0] * S); right_f = int(loc_s[1] * S)
-    bot_f  = int(loc_s[2] * S); left_f  = int(loc_s[3] * S)
-    face_box = {"top": top_f, "right": right_f, "bottom": bot_f, "left": left_f}
+    is_stable = cache.get("is_stable", False)
 
-    # ── Stability gate ────────────────────────────────────────────────────────
-    is_stable_frame = compute_face_stability(cache.get("last_face_box"), face_box)
-    cache["last_face_box"] = face_box
-    cache["stable_count"]  = (cache.get("stable_count", 0) + 1) if is_stable_frame else 0
-    is_stable = cache["stable_count"] >= STABILITY_REQUIRED_FRAMES
+    # Landmarks + EAR every frame (cheap — landmarks on cached small-frame locations)
+    if is_stable:
+        all_lm_s = face_recognition.face_landmarks(rgb_s, face_locs_s)
+        if all_lm_s:
+            cache["last_lm_s"] = all_lm_s[0]
+            blink_tracker.update(all_lm_s[0])
+        # Cache encoding once for backend phase (only on face-detect frames)
+        if "last_enc_s" not in cache and run_face:
+            enc_list = face_recognition.face_encodings(rgb_s, face_locs_s)
+            if enc_list:
+                cache["last_enc_s"] = enc_list[0]
 
-    lm_full = {k: [(int(x*S), int(y*S)) for x, y in pts] for k, pts in lm_s.items()}
-    if lm_full:
-        blink_tracker.update(lm_s)   # EAR uses small-frame landmarks
-
+    # Draw appropriate status overlay
     if not is_stable:
-        stable_pending = {
-            "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
-            "label": "Hold still…", "reason": "Waiting for stable face",
-            "name": "", "username": "",
-        }
-        draw_rbac_result(result, face_box, stable_pending)
+        sc  = cache.get("stable_count", 0)
+        pen = {"action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+               "label": f"Hold still… ({sc}/{STABILITY_REQUIRED_FRAMES})",
+               "reason": "Stabilising face detection", "name": "", "username": ""}
+        draw_rbac_result(result, face_box, pen)
         stamp_status(result, "HOLD STILL", (0, 200, 255))
-        cache["frame_n"] = frame_n + 1
-        return result, None, None, tailgating, "HOLD STILL"
+        cache.update({"frame_n": frame_n + 1, "pipeline_stage": "hold_still"})
+        return result, None, None, False, "HOLD STILL"
 
-    # ── Tailgating gate (after stability confirmed) ───────────────────────────
-    if tailgating:
-        tg_pending = {
-            "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
-            "label": "Tailgating detected", "reason": "Multiple persons in frame",
-            "name": "", "username": "",
-        }
-        draw_rbac_result(result, face_box, tg_pending)
-        stamp_status(result, "TAILGATING ALERT", (0, 0, 220))
-        cache["frame_n"] = frame_n + 1
-        return result, None, None, tailgating, "TAILGATING"
+    if not blink_tracker.passed:
+        pen = {"action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
+               "label": "Blink once to confirm liveness",
+               "reason": "Waiting for blink", "name": "", "username": ""}
+        draw_rbac_result(result, face_box, pen)
+        stamp_ear(result, blink_tracker.last_ear, blink_tracker.blink_count, blink_tracker.passed)
+        stamp_status(result, "BLINK ONCE", (0, 200, 255))
+        cache.update({"frame_n": frame_n + 1, "pipeline_stage": "blink_required"})
+        return result, None, None, False, "BLINK REQUIRED"
 
-    # ── Face chip for spoof checks ────────────────────────────────────────────
-    roi  = frame_bgr[top_f:bot_f, left_f:right_f]
-    gray = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (64, 64)) if roi.size > 0 else None
-    spoof = static_spoof_check(gray, lm_s) if gray is not None else dict(_SPOOF_FALLBACK)
+    # Blink confirmed — ensure encoding is captured before animation starts
+    if "last_enc_s" not in cache:
+        enc_list = face_recognition.face_encodings(rgb_s, face_locs_s)
+        if enc_list:
+            cache["last_enc_s"] = enc_list[0]
 
-    if gray is not None:
-        t_result = temporal_spoof_check(cache.get("prev_gray_face"), gray, cache, security_mode)
-        r_result = replay_artifact_check(gray)
-        spoof    = aggregate_spoof_result(spoof, blink_tracker.passed, t_result, r_result, security_mode)
-    else:
-        spoof["is_live"] = spoof.get("is_live", True) and blink_tracker.passed
-        spoof.setdefault("status", "LIVE" if spoof["is_live"] else "WAITING FOR BLINK")
-
-    decision   = None
-    status_msg = "SCANNING"
-
-    if run_recog:
-        # ── Priority 1: Blacklist check FIRST ─────────────────────────────────
-        is_bl, bl_entry, _ = check_blacklist(enc_s)
-        if is_bl:
-            decision = make_blacklist_decision(bl_entry)
-            draw_rbac_result(result, face_box, decision)
-            stamp_status(result, "SECURITY ALERT", (0, 0, 220))
-            cache["frame_n"] = frame_n + 1
-            return result, decision, spoof, tailgating, "BLACKLISTED"
-
-        # ── Priority 2: Liveness gate ──────────────────────────────────────────
-        if not blink_tracker.passed:
-            blink_pending = {
-                "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
-                "label": "Blink once to confirm liveness…",
-                "reason": "Waiting for blink", "name": "", "username": "",
-            }
-            draw_rbac_result(result, face_box, blink_pending)
-            stamp_ear(result, getattr(blink_tracker, "last_ear", 1.0),
-                      blink_tracker.blink_count, blink_tracker.passed)
-            stamp_status(result, "BLINK ONCE", (0, 200, 255))
-            cache["frame_n"] = frame_n + 1
-            return result, None, spoof, tailgating, "BLINK REQUIRED"
-
-        # ── Priority 3: Spoof gate ─────────────────────────────────────────────
-        if not spoof.get("is_live", True):
-            spoof_decision = {
-                "action": "DENY", "role": "spoof", "color": ROLE_COLORS["spoof"],
-                "label": f"Anti-spoofing failed — {spoof.get('status', 'SPOOF SUSPECTED')}",
-                "reason": "Possible replay/print attack", "name": "", "username": "",
-            }
-            draw_rbac_result(result, face_box, spoof_decision)
-            stamp_status(result, "SPOOF SUSPECTED", (0, 80, 255))
-            cache["frame_n"] = frame_n + 1
-            return result, spoof_decision, spoof, tailgating, "SPOOF"
-
-        # ── Priority 4: Identity verification ─────────────────────────────────
-        match, confidence = verify_claimed_user(enc_s, claimed_username, security_mode)
-        if match:
-            decision = make_decision(match, confidence, spoof.get("is_live", True), security_mode)
-        else:
-            pending = {
-                "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
-                "label": f"Verifying… ({confidence:.0%})",
-                "reason": "Scanning", "name": "", "username": "",
-            }
-            draw_rbac_result(result, face_box, pending)
-
-        cache["last_match"]      = match
-        cache["last_confidence"] = confidence if match else 0.0
-    else:
-        # Show last known state between recognition frames
-        last_label = f"Verifying… ({cache.get('last_confidence', 0.0):.0%})"
-        pending = {
-            "action": "DENY", "role": "unknown", "color": ROLE_COLORS["unknown"],
-            "label": last_label, "reason": "Scanning", "name": "", "username": "",
-        }
-        draw_rbac_result(result, face_box, pending)
-
-    if decision and decision["action"] in ("ALLOW", "ALERT"):
-        stamp_status(result,
-                     "ACCESS GRANTED" if decision["action"] == "ALLOW" else "SECURITY ALERT",
-                     (0, 200, 0) if decision["action"] == "ALLOW" else (0, 0, 220))
-        cache["frame_n"] = frame_n + 1
-        return result, decision, spoof, tailgating, "COMPLETE"
-
-    stamp_ear(result, getattr(blink_tracker, "last_ear", 1.0),
-              blink_tracker.blink_count, blink_tracker.passed)
-    stamp_status(result, "SCANNING…", (0, 140, 255))
+    cache.update({"scan_started": True, "scan_frame": 0,
+                  "pipeline_stage": "scanning_animation"})
+    draw_scanning_bar(result, 0, TERMINAL_SCAN_FRAMES, face_box)
     cache["frame_n"] = frame_n + 1
-    return result, None, spoof, tailgating, status_msg
+    return result, None, None, False, "SCANNING"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1029,37 +1051,99 @@ elif page == "Security Terminal":
             )
             st.session_state["terminal_cache"] = t_cache
 
+            # ── Layout: camera feed + pipeline status panel ───────────────────
             col_feed, col_panel = st.columns([3, 2])
             with col_feed:
                 st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
                          use_container_width=True)
+
             with col_panel:
-                # Stability status
-                stable_ct = t_cache.get("stable_count", 0)
-                if stable_ct < STABILITY_REQUIRED_FRAMES:
-                    st.info(f":material/timer: Hold still… ({stable_ct}/{STABILITY_REQUIRED_FRAMES} frames)")
-                else:
-                    st.success(":material/check_circle: Face stable")
+                st.markdown("#### :material/monitoring: Pipeline Status")
+                pipeline_stage = t_cache.get("pipeline_stage", "pre_scan")
 
-                # Liveness
-                sp_stat = (spoof or {}).get("status", "—")
-                if blink_tracker.passed:
-                    st.success(f":material/visibility: Liveness: `{sp_stat}`")
-                else:
-                    st.info(f":material/visibility: Blinks: {blink_tracker.blink_count} — blink once")
+                # Map current stage → human label + hint
+                _STAGE_MAP = {
+                    "waiting_for_face":   ("Waiting for face",       "Position your face in frame"),
+                    "hold_still":         ("Hold still check",        "Please stop moving"),
+                    "blink_required":     ("Blink liveness check",    "Blink once to confirm liveness"),
+                    "scanning_animation": ("Scanning animation",      "Hold still — scan in progress"),
+                    "backend_checks":     ("Backend checks",          "Running security verification…"),
+                    "tailgating_alert":   ("Tailgating detection",    "Multiple persons detected — denied"),
+                    "spoof_rejected":     ("Anti-spoofing check",     "Spoof suspected — denied"),
+                    "blacklist_alert":    ("Blacklist check",         "Blacklisted user detected — alert"),
+                    "complete":           ("Final decision",          "Authentication complete"),
+                }
+                _stage_label, _stage_hint = _STAGE_MAP.get(pipeline_stage, ("Processing…", ""))
+                st.info(f":material/bolt: **Current process:** {_stage_label}")
+                if _stage_hint:
+                    st.caption(_stage_hint)
 
-                # Spoof
+                # Stage pipeline with status icons
+                _SI = {
+                    "passed":  (":material/check_circle:",           "green"),
+                    "running": (":material/sync:",                   "#1e90ff"),
+                    "waiting": (":material/radio_button_unchecked:", "gray"),
+                    "failed":  (":material/cancel:",                 "#cc2222"),
+                    "skipped": (":material/block:",                  "gray"),
+                }
+
+                def _row(label: str, st_key: str) -> None:
+                    icon, color = _SI[st_key]
+                    st.markdown(
+                        f"{icon} <span style='color:{color}'>{label}</span> "
+                        f"`{st_key}`",
+                        unsafe_allow_html=True,
+                    )
+
+                def _stage_statuses(ps: str, dec: "dict | None") -> list:
+                    p = "passed"; w = "waiting"; r = "running"; f = "failed"; s = "skipped"
+                    base = [p, w, w, w, w, w, w, w, w, w]
+                    m = {
+                        "waiting_for_face":   [p, r, w, w, w, w, w, w, w, w],
+                        "hold_still":         [p, p, r, w, w, w, w, w, w, w],
+                        "blink_required":     [p, p, p, r, w, w, w, w, w, w],
+                        "scanning_animation": [p, p, p, p, r, w, w, w, w, w],
+                        "backend_checks":     [p, p, p, p, p, r, w, w, w, w],
+                        "tailgating_alert":   [p, p, p, p, p, f, s, s, s, f],
+                        "spoof_rejected":     [p, p, p, p, p, p, f, s, s, f],
+                        "blacklist_alert":    [p, p, p, p, p, p, p, f, s, f],
+                        "complete": (
+                            [p, p, p, p, p, p, p, p, p, p]
+                            if dec and dec.get("action") == "ALLOW"
+                            else [p, p, p, p, p, p, p, p, f, f]
+                        ),
+                    }
+                    return m.get(ps, base)
+
+                statuses = _stage_statuses(pipeline_stage, decision)
+                stage_names = [
+                    "Credentials verified",
+                    "Waiting for face",
+                    "Face stability check",
+                    "Blink liveness check",
+                    "Scanning animation",
+                    "Tailgating detection",
+                    "Anti-spoofing check",
+                    "Blacklist check",
+                    "Identity verification",
+                    "Final decision",
+                ]
+                st.divider()
+                for sname, skey in zip(stage_names, statuses):
+                    _row(sname, skey)
+
+                # Spoof detail when relevant
                 if spoof and not spoof.get("is_live", True):
-                    st.error(f":material/block: Anti-spoofing: `{sp_stat}`")
+                    st.divider()
+                    st.error(f":material/block: {spoof.get('status', 'SPOOF SUSPECTED')}")
                     if spoof.get("suspicious_static"):
                         st.caption("Motion check failed — possible replay attack")
 
-                # Tailgating warning
                 if term_tailgating:
-                    st.error(":material/group: **Tailgating** — multiple persons detected! Access blocked.")
+                    st.error(":material/group: **Tailgating** — multiple persons detected!")
 
-            # ── Definitive outcome: ALLOW or ALERT ────────────────────────────
-            if decision and decision["action"] in ("ALLOW", "ALERT"):
+            # ── Definitive outcomes: log and transition to result ─────────────
+            if term_status in ("COMPLETE", "BLACKLISTED", "SPOOF") and decision:
                 log_access_event(
                     detected_name=decision.get("name", user_data.get("name", "")),
                     username=claimed_username,
@@ -1076,7 +1160,6 @@ elif page == "Security Terminal":
                 st.session_state["terminal_result"] = decision
                 st.rerun()
 
-            # ── Tailgating denial — stop scan and transition ───────────────────
             if term_status == "TAILGATING":
                 tg_decision = {
                     "action": "DENY",
@@ -1165,10 +1248,6 @@ elif page == "Register User":
     if "reg_n" not in st.session_state:
         st.session_state.reg_n = 0
     n = st.session_state.reg_n
-
-    if st.button("Clear everything", icon=":material/refresh:", type="secondary"):
-        st.session_state.reg_n += 1
-        st.rerun()
 
     tab_manual, tab_blacklist, tab_bulk = st.tabs(
         ["Enroll Authorized User", "Blacklist Entry", "Bulk Import — Pins Dataset"]
@@ -1314,6 +1393,9 @@ elif page == "Register User":
                     c4.image(sample_feat["hog_vis"], caption="HOG gradient image", clamp=True)
 
         with col_info:
+            if st.button("Clear everything", icon=":material/refresh:", type="secondary"):
+                st.session_state.reg_n += 1
+                st.rerun()
             st.markdown("""
 **Role descriptions**
 
@@ -1616,9 +1698,9 @@ elif page == "Identify: Image":
             st.divider()
             st.subheader(":material/model_training: KNN Secondary Verification")
             st.caption(
-                "Classical KNN classifier (Canny + LBP + HOG features) trained on "
-                "enrolled face images. Acts as an independent second opinion alongside "
-                "the deep ResNet embedding matcher."
+                "Classical KNN classifier (Canny + LBP + HOG features) — diagnostic only. "
+                "The final access decision is based on the primary ResNet/RBAC pipeline. "
+                "KNN output is shown for comparison and is **never** used to override the decision."
             )
 
             if not knn_is_ready():
@@ -1631,25 +1713,45 @@ elif page == "Identify: Image":
                 st.caption(
                     f"Model: KNN k={info['k']} · "
                     f"{info['n_samples']} training samples · "
-                    f"{info['n_classes']} enrolled users"
+                    f"{info['n_classes']} enrolled users · "
+                    f"confidence threshold: {info['threshold']:.0%}"
                 )
+                if info.get("low_sample_warning"):
+                    st.warning(
+                        ":material/warning: One or more users have fewer than 3 training images — "
+                        "KNN predictions may be unreliable. Enrol more photos per user."
+                    )
                 for i, feats in enumerate(feat_list):
                     if feats is None:
                         continue
                     knn_user, knn_conf = predict_knn(feats["feature_vector"])
+                    # knn_user is None when confidence is below KNN_CONFIDENCE_THRESHOLD
                     dlib_user = decisions[i].get("username", "") if i < len(decisions) else ""
 
                     col_k1, col_k2, col_k3 = st.columns(3)
-                    col_k1.metric(f"Face {i+1} — KNN prediction", knn_user or "Unknown")
-                    col_k2.metric("KNN confidence", f"{knn_conf:.0%}")
 
-                    if dlib_user and knn_user:
-                        if knn_user == dlib_user:
-                            col_k3.success("Both models agree")
-                        else:
-                            col_k3.warning(f"Mismatch — ResNet says `{dlib_user}`")
+                    if knn_user is None:
+                        col_k1.metric(f"Face {i+1} — KNN (diagnostic)", "Unknown")
+                        col_k2.metric("KNN confidence (raw)", f"{knn_conf:.0%}")
+                        col_k3.caption(
+                            ":material/info: Confidence below threshold — "
+                            "prediction rejected, result not used."
+                        )
                     else:
-                        col_k3.info("ResNet: no match found")
+                        col_k1.metric(f"Face {i+1} — KNN (diagnostic)", knn_user)
+                        col_k2.metric("KNN confidence", f"{knn_conf:.0%}")
+                        if dlib_user and knn_user == dlib_user:
+                            col_k3.success(":material/check_circle: KNN agrees with primary recognizer")
+                        elif dlib_user:
+                            col_k3.warning(
+                                f":material/warning: KNN mismatch — ResNet says `{dlib_user}`. "
+                                "KNN result ignored for final decision."
+                            )
+                        else:
+                            col_k3.info(
+                                ":material/info: ResNet found no identity match — "
+                                "KNN result is diagnostic only."
+                            )
 
         if tailgating:
             st.error("Tailgating detected — multiple persons in frame!")
@@ -1670,117 +1772,22 @@ elif page == "Identify: Image":
                 c4.image(feats["hog_vis"],  caption="HOG gradients",    clamp=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# IDENTIFY: VIDEO
-# Third input modality — upload a video file and run the full pipeline on a
-# sampled set of frames. Useful for replaying access scenarios, testing
-# anti-spoofing on recorded replay attacks, and generating report metrics.
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Identify: Video":
-    st.markdown("# :material/video_file: Identify: Video")
-    st.caption("Upload a video file. The pipeline runs on a sampled set of frames.")
-
-    col_opts, _ = st.columns([2, 3])
-    with col_opts:
-        hq             = st.toggle("High quality camera", value=True, key="vid_hq",
-                                   help="ON = normal thresholds. OFF = relaxed anti-spoofing.")
-        sec_mode       = "normal" if hq else "relaxed"
-        show_landmarks = st.checkbox("Show facial landmarks", value=True, key="vid_lm")
-        frame_stride   = st.slider("Process every N frames", 1, 30, 10, key="vid_stride",
-                                   help="Higher = faster processing, fewer results.")
-
-    uploaded_vid = st.file_uploader(
-        "Upload a video file", type=["mp4", "avi", "mov", "mkv"], key="vid_upload"
-    )
-
-    if uploaded_vid and st.button("Run Pipeline on Video", type="primary",
-                                  icon=":material/play_arrow:"):
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(uploaded_vid.name)[1],
-                                        delete=False) as tmp_vid:
-            tmp_vid.write(uploaded_vid.read())
-            tmp_path = tmp_vid.name
-
-        cap = cv2.VideoCapture(tmp_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps_native   = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        sample_count = max(1, total_frames // frame_stride)
-
-        st.info(
-            f"Video: **{total_frames}** frames @ {fps_native:.1f} FPS  ·  "
-            f"Processing every {frame_stride} frames → ~{sample_count} samples"
-        )
-
-        prog        = st.progress(0.0, text="Processing frames…")
-        results_buf = []   # (frame_idx, annotated_bgr, decisions, tailgating)
-        frame_idx   = 0
-        processed   = 0
-        t_start     = time.time()
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % frame_stride == 0:
-                ann, faces, decisions, _, _, _, tailgating, _ = \
-                    _run_pipeline(frame, sec_mode, show_landmarks, "video")
-                results_buf.append((frame_idx, ann, decisions, tailgating))
-                processed += 1
-                prog.progress(
-                    min(frame_idx / max(total_frames - 1, 1), 1.0),
-                    text=f"Frame {frame_idx}/{total_frames}…"
-                )
-            frame_idx += 1
-
-        cap.release()
-        os.unlink(tmp_path)
-        elapsed = time.time() - t_start
-        prog.progress(1.0, text="Done.")
-
-        st.success(
-            f"Processed **{processed}** frames in {elapsed:.1f} s  "
-            f"({processed / elapsed:.1f} frames/s)"
-        )
-
-        if not results_buf:
-            st.warning("No frames could be processed.")
-        else:
-            # Summary stats
-            allow_ct = sum(
-                1 for _, _, decs, _ in results_buf
-                if any(d["action"] == "ALLOW" for d in decs)
-            )
-            deny_ct  = processed - allow_ct
-            tg_ct    = sum(1 for _, _, _, tg in results_buf if tg)
-
-            sc1, sc2, sc3 = st.columns(3)
-            sc1.metric("Frames with ACCESS GRANTED", allow_ct)
-            sc2.metric("Frames with ACCESS DENIED",  deny_ct)
-            sc3.metric("Frames with tailgating",      tg_ct)
-
-            st.divider()
-            st.markdown("#### Sampled frame results")
-            # Show up to 8 annotated frames in a grid
-            display_buf = results_buf[:8]
-            cols = st.columns(min(len(display_buf), 4))
-            for col_i, (fidx, ann, decs, tg) in enumerate(display_buf):
-                action = (
-                    "GRANT" if any(d["action"] == "ALLOW" for d in decs)
-                    else "ALERT" if any(d["action"] == "ALERT" for d in decs)
-                    else "DENY"
-                )
-                cols[col_i % 4].image(
-                    cv2.cvtColor(ann, cv2.COLOR_BGR2RGB),
-                    caption=f"Frame {fidx} — {action}{'  ⚠ tailgate' if tg else ''}",
-                    use_container_width=True,
-                )
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LIVE CAMERA
 # ═══════════════════════════════════════════════════════════════════════════════
 elif page == "Live Camera":
-    st.markdown("# :material/videocam: Live Camera")
-    st.caption("Real-time access control via webcam. Blink once to confirm liveness.")
+    st.markdown("# :material/videocam: Live Camera — Testing Mode")
+    st.caption(
+        "Testing live camera feed. Blink once to confirm liveness. "
+        "**Events from this page are not recorded in the access log.**"
+    )
+    st.info(
+        ":material/science: This page is for testing and development only. "
+        "Detection results are displayed visually but are **not** written to the access log. "
+        "Use the **Security Terminal** for authenticated access events.",
+        icon=":material/info:",
+    )
 
     cam_running = st.session_state.get("cam_running", False)
 
@@ -2107,8 +2114,9 @@ elif page == "Access Log":
             default=["ALLOW", "DENY", "ALERT"],
         )
         source_filter = col_f2.multiselect(
-            "Filter by source", ["image", "live", "terminal"],
-            default=["image", "live", "terminal"],
+            "Filter by source", ["image", "terminal", "live"],
+            default=["image", "terminal"],
+            help="'live' events are from the Testing page and are no longer logged by default.",
         )
 
         mask = df["action"].isin(action_filter) & df["source"].isin(source_filter)
