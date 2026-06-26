@@ -2113,3 +2113,4 @@ elif page == "Access Log":
             clear_access_log()
             st.success("Log cleared.")
             st.rerun()
+            
