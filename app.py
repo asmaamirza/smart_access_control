@@ -340,6 +340,7 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
 
     has_motion = bool(motion_regions_s)
     cache_warm = "faces" in cache
+    has_tracked_face = cache_warm and bool(cache.get("faces"))
 
     # ── CLAHE — cached, recomputed every _CLAHE_EVERY frames ─────────────────
     if frame_n % _CLAHE_EVERY == 0 or "enhanced_s" not in cache:
@@ -351,7 +352,9 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
         stage_log.append(("Image enhancement", "cached"))
 
     # ── SLOW-1: face recognition — every N frames when motion present ─────────
-    run_face = (frame_n % face_every == 0) and (has_motion or not cache_warm)
+    # Motion gating is only a perf optimization for an empty scene — once we're
+    # actively tracking a face, keep updating on cadence even if they're still.
+    run_face = (frame_n % face_every == 0) and (has_motion or not cache_warm or has_tracked_face)
 
     if run_face:
         rgb_s   = cv2.cvtColor(enhanced_s, cv2.COLOR_BGR2RGB)
@@ -371,12 +374,14 @@ def _run_pipeline_live(frame_bgr: np.ndarray,
                                           blink_tracker=blink_tracker)
 
         # ── Stability tracking (first face box) ───────────────────────────────
+        # in _run_pipeline_live's stability block
         if faces:
             curr_box = faces[0]
             is_stable_frame = compute_face_stability(cache.get("last_face_box"), curr_box)
             cache["last_face_box"] = curr_box
-            cache["stable_count"]  = (cache.get("stable_count", 0) + 1) if is_stable_frame else 0
-            cache["is_stable"]     = cache["stable_count"] >= STABILITY_REQUIRED_FRAMES
+            cache["stable_count"] = (cache.get("stable_count", 0) + 1) if is_stable_frame \
+                                    else max(0, cache.get("stable_count", 0) - 1)
+            cache["is_stable"] = cache["stable_count"] >= STABILITY_REQUIRED_FRAMES
         else:
             cache["stable_count"] = 0
             cache["is_stable"]    = False
@@ -827,8 +832,9 @@ def _run_terminal_pipeline(frame_bgr: np.ndarray,
                     "bottom": int(loc_s[2] * S), "left":  int(loc_s[3] * S)}
         ok = compute_face_stability(cache.get("last_face_box"), face_box)
         cache["last_face_box"] = face_box
-        cache["stable_count"]  = (cache.get("stable_count", 0) + 1) if ok else 0
-        cache["is_stable"]     = cache["stable_count"] >= STABILITY_REQUIRED_FRAMES
+        cache["stable_count"] = (cache.get("stable_count", 0) + 1) if ok \
+                                else max(0, cache.get("stable_count", 0) - 1)
+        cache["is_stable"] = cache["stable_count"] >= STABILITY_REQUIRED_FRAMES
     else:
         face_box = cache.get("last_face_box")
         if face_box is None:

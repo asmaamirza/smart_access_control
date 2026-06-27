@@ -21,8 +21,8 @@ relaxed  ≥ 0.12  (permissive; demo / low-risk environments)
 """
 
 THRESHOLDS = {
-    "normal":  0.25,
-    "relaxed": 0.12,
+    "normal":  0.55,
+    "relaxed": 0.50,
 }
 
 # BGR colours for bounding boxes
