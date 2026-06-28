@@ -772,12 +772,127 @@ def _enroll_camera_loop():
                 session.reset_current_pose()
 
     # ── Enrollment complete → finalize and persist ────────────────────────────
+    # This block is intentionally OUTSIDE `with col_panel:` (top-level in the
+    # function), so it only ever runs once the pose sequence is actually done
+    # — and ok/msg are only ever referenced inside this same guarded block.
     if outcome["status"] == "enrollment_complete":
         password = st.session_state.pop("enroll_pending_password", None)
-        with st.spinner("Averaging encodings and saving to database…"):
+        with st.spinner("Averaging encodings, saving, and training KNN…"):
             ok, msg = session.finalize(password=password)
-            if ok:
-                train_knn()  # keep diagnostic KNN in sync; never blocks enrollment
+            # train_knn() now runs INSIDE finalize() itself, since that's
+            # also where the captured images get saved to known_faces/.
+            # Calling it again here would just retrain on the same data
+            # for no reason.
+        cap_ref = st.session_state.pop("enroll_cap", None)
+        if cap_ref:
+            cap_ref.release()
+        st.session_state.update({
+            "enroll_state":      "result",
+            "enroll_result_ok":  ok,
+            "enroll_result_msg": msg,
+        })
+        st.rerun()
+        return
+
+    time.sleep(0.03)
+    st.rerun()  # fragment-scoped: rest of the page/sidebar untouched
+    session = st.session_state["enroll_session"]
+
+    if "enroll_cap" not in st.session_state:
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not cap.isOpened():
+            st.error("Cannot open webcam. Check camera permissions.")
+            return
+        st.session_state["enroll_cap"] = cap
+
+    cap = st.session_state["enroll_cap"]
+    cap.grab(); cap.grab()
+    ret, frame = cap.read()
+
+    if not ret:
+        st.warning("Failed to read frame from webcam.")
+        time.sleep(0.05)
+        st.rerun()
+        return
+
+    outcome = session.process_frame(frame)
+    annotated = frame.copy()
+
+    # ── Draw face box + status, mirroring draw_rbac_result's visual language ──
+    box = outcome["face_box"]
+    if box:
+        _STATUS_COLOR = {
+            "no_face":        (160, 160, 160),
+            "blurry":         (0, 140, 255),
+            "spoof_rejected": (0, 80, 255),
+            "pose_mismatch":  (0, 200, 255),
+            "cooldown":       (0, 200, 255),
+            "captured":       (0, 200, 0),
+            "pose_complete":  (0, 220, 0),
+            "enrollment_complete": (0, 220, 0),
+        }
+        color = _STATUS_COLOR.get(outcome["status"], (200, 200, 200))
+        cv2.rectangle(annotated, (box["left"], box["top"]),
+                      (box["right"], box["bottom"]), color, 2)
+
+    col_feed, col_panel = st.columns([3, 2])
+
+    with col_feed:
+        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+    with col_panel:
+        pose = outcome["pose"]
+        if pose is not None:
+            st.markdown(f"### :material/face: {pose.instruction}")
+            st.progress(min(pose.collected / pose.target, 1.0),
+                       text=f"{pose.collected}/{pose.target} samples for this pose")
+        else:
+            st.markdown("### :material/check_circle: All poses captured")
+
+        st.progress(
+            min(outcome["total_collected"] / outcome["total_target"], 1.0)
+            if outcome["total_target"] else 0.0,
+            text=f"Overall: {outcome['total_collected']}/{outcome['total_target']} samples",
+        )
+
+        st.divider()
+
+        _MSG_STYLE = {
+            "no_face":             st.warning,
+            "blurry":              st.warning,
+            "spoof_rejected":      st.error,
+            "pose_mismatch":       st.info,
+            "cooldown":            st.info,
+            "captured":            st.success,
+            "pose_complete":       st.success,
+            "enrollment_complete": st.success,
+        }
+        _MSG_STYLE.get(outcome["status"], st.info)(outcome["message"])
+
+        st.caption(
+            "Sequence: " + "  →  ".join(
+                ("✅ " if p.done else ("▶ " if p is pose else "· ")) + p.instruction.split()[-1]
+                for p in session.poses
+            )
+        )
+
+        st.divider()
+        if pose is not None and pose.collected > 0:
+            if st.button("Redo this pose", icon=":material/refresh:", use_container_width=True):
+                session.reset_current_pose()
+
+    # ── Enrollment complete → finalize and persist ────────────────────────────
+        if outcome["status"] == "enrollment_complete":
+            password = st.session_state.pop("enroll_pending_password", None)
+            with st.spinner("Averaging encodings, saving, and training KNN…"):
+                ok, msg = session.finalize(password=password)
+                # train_knn() now runs INSIDE finalize() itself, since that's
+                # also where the captured images get saved to known_faces/.
+                # Calling it again here would just retrain on the same data
+                # for no reason.
         cap_ref = st.session_state.pop("enroll_cap", None)
         if cap_ref:
             cap_ref.release()

@@ -19,8 +19,30 @@ samples, we move to the next pose. When every pose is done we average every
 collected 128-d face_recognition encoding into one robust identity vector and
 write it straight into the DB via `update_face_encoding()` / `create_user()`.
 
-No images are ever written to disk and no classifier is trained — the DB
-*is* the model, exactly as documented in face_recognizer.py.
+──────────────────────────────────────────────────────────────────────────────
+WHY ACCEPTED FRAMES ARE ALSO SAVED TO known_faces/ (read before removing this)
+──────────────────────────────────────────────────────────────────────────────
+The 128-d ResNet encoding (averaged, stored in the DB) is and remains the
+ONLY thing that drives access decisions anywhere in this app — recognition
+logic in face_recognizer.py is untouched and does not read known_faces/.
+
+However, modules/knn_engine.py trains a *separate* classifier on classical
+Canny+LBP+HOG feature vectors, and its own docstring states this exists to
+satisfy the project requirement of having at least one model trained on
+custom data. That feature extraction (feature_extractor.py: Canny edges, LBP
+texture, HOG gradients) operates on raw pixels — there is no embedding-based
+substitute for it, so train_knn() genuinely needs JPEG files in
+known_faces/<username>/ to have anything to train on.
+
+So: every frame that passes all three quality gates below gets saved as a
+JPEG into known_faces/<username>/ in addition to having its encoding
+collected. This is a deliberate, narrow exception to "nothing touches disk"
+— these are frames the system already judged good enough to enroll with, the
+write only happens for accepted samples (not raw unfiltered footage), and it
+exists solely so the classical-CV/KNN system the rubric requires has
+something real to train on. If that requirement goes away, this save step
+(and the train_knn() call in finalize()) can be deleted with no effect on
+recognition — the encoding path doesn't depend on it.
 
 State machine
 -------------
@@ -61,6 +83,7 @@ detection" so the person isn't stuck guessing which direction to adjust.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import cv2
@@ -69,6 +92,9 @@ import face_recognition as fr
 
 from modules.anti_spoofing import static_spoof_check
 from modules.database import create_user, update_face_encoding
+from modules.knn_engine import train_knn
+
+KNOWN_FACES_DIR = "known_faces"
 
 # ── Pose sequence ─────────────────────────────────────────────────────────────
 # Each pose: (key, instruction shown to the user, validator name)
@@ -132,6 +158,7 @@ class EnrollmentSession:
     ])
     current_pose_idx: int = 0
     encodings: list = field(default_factory=list)
+    saved_image_paths: list = field(default_factory=list)  # mirrors `encodings` 1:1
     _frame_n: int = 0
     _last_capture_frame: int = -999
     _straight_baseline_chin_ratio: float | None = None
@@ -234,6 +261,13 @@ class EnrollmentSession:
         pose.collected += 1
         self._last_capture_frame = self._frame_n
 
+        # Save the accepted crop to disk too — purely so knn_engine.train_knn()
+        # has real images to train its classical-feature classifier on (see
+        # module docstring). This does NOT feed recognition; the encoding
+        # appended above is the only thing that drives access decisions.
+        saved_path = self._save_sample_image(frame_bgr, face_box, pose.key, pose.collected)
+        self.saved_image_paths.append(saved_path)
+
         if pose.collected >= pose.target:
             pose.done = True
             self.current_pose_idx += 1
@@ -246,6 +280,40 @@ class EnrollmentSession:
 
         return self._result("captured", face_box,
                             f"Captured {pose.collected}/{pose.target} for '{pose.instruction}'.", pose)
+
+    def _save_sample_image(self, frame_bgr: np.ndarray, face_box: dict,
+                           pose_key: str, sample_n: int) -> str | None:
+        """
+        Save the accepted face crop to known_faces/<username>/<pose>_<NN>.jpg.
+
+        Crops with a small margin (not just the tight box) so train_knn()'s
+        own face_locations() + extract_all() pipeline has enough context to
+        re-detect and align the face, same as it would for any other image
+        in that folder. Returns the saved path, or None if the write failed
+        (failure here must never break enrollment — it only weakens the
+        diagnostic KNN's training set, not recognition).
+        """
+        try:
+            user_dir = os.path.join(KNOWN_FACES_DIR, self.username)
+            os.makedirs(user_dir, exist_ok=True)
+
+            h, w = frame_bgr.shape[:2]
+            margin = int(0.25 * max(face_box["bottom"] - face_box["top"],
+                                    face_box["right"] - face_box["left"]))
+            top    = max(face_box["top"] - margin, 0)
+            bottom = min(face_box["bottom"] + margin, h)
+            left   = max(face_box["left"] - margin, 0)
+            right  = min(face_box["right"] + margin, w)
+            crop = frame_bgr[top:bottom, left:right]
+            if crop.size == 0:
+                return None
+
+            filename = f"{pose_key}_{sample_n:02d}.jpg"
+            path = os.path.join(user_dir, filename)
+            ok = cv2.imwrite(path, crop)
+            return path if ok else None
+        except Exception:
+            return None
 
     # ── Pose heuristic ────────────────────────────────────────────────────────
     def _pose_matches(self, pose_key: str, landmarks: dict) -> tuple[bool, str | None]:
@@ -342,6 +410,14 @@ class EnrollmentSession:
         creates the user record too; otherwise just updates the encoding for
         an existing username (re-enrollment).
 
+        After a successful save, retrains the diagnostic KNN classifier
+        (modules/knn_engine.py) on the images this session just wrote to
+        known_faces/ — this is the only consumer of those saved JPEGs;
+        recognition itself never reads them. A KNN retrain failure is
+        reported but does not flip the overall result to failure: the
+        encoding is the part that matters for access control and it already
+        succeeded by the time train_knn() runs.
+
         Returns (success, message).
         """
         if not self.encodings:
@@ -356,10 +432,20 @@ class EnrollmentSession:
 
         if password is not None:
             ok, msg = create_user(self.name, self.username, password, self.role, final_encoding)
+        else:
+            update_face_encoding(self.username, final_encoding)
+            ok, msg = True, f"Face encoding updated for '{self.username}' from {len(self.encodings)} samples."
+
+        if not ok:
             return ok, msg
 
-        update_face_encoding(self.username, final_encoding)
-        return True, f"Face encoding updated for '{self.username}' from {len(self.encodings)} samples."
+        knn_ok, knn_msg = train_knn()
+        if knn_ok:
+            msg += f" KNN classifier retrained ({knn_msg})."
+        else:
+            msg += f" (Note: KNN retrain skipped — {knn_msg})"
+
+        return True, msg
 
     def reset_current_pose(self) -> None:
         """Allow the UI to let the user redo the in-progress pose from scratch."""
@@ -367,7 +453,17 @@ class EnrollmentSession:
         if pose is None:
             return
         if pose.collected:
-            # Drop only the encodings captured for this pose (the most recent N)
+            # Drop the encodings AND the saved image files captured for this
+            # pose (the most recent N of each) so a "redo" doesn't leave
+            # orphaned training images on disk with no matching encoding.
             self.encodings = self.encodings[: len(self.encodings) - pose.collected]
+            stale_paths = self.saved_image_paths[len(self.saved_image_paths) - pose.collected:]
+            for p in stale_paths:
+                if p:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            self.saved_image_paths = self.saved_image_paths[: len(self.saved_image_paths) - pose.collected]
         pose.collected = 0
         pose.done = False
