@@ -1057,7 +1057,7 @@ elif page == "Security Terminal":
                     "waiting_for_face":   ("Waiting for face",       "Position your face in frame"),
                     "hold_still":         ("Hold still check",        "Please stop moving"),
                     "blink_required":     ("Blink liveness check",    "Blink once to confirm liveness"),
-                    "scanning_animation": ("Scanning animation",      "Hold still — scan in progress"),
+                    "scanning_animation": ("Scanning face",      "Hold still — scan in progress"),
                     "backend_checks":     ("Backend checks",          "Running security verification…"),
                     "tailgating_alert":   ("Tailgating detection",    "Multiple persons detected — denied"),
                     "spoof_rejected":     ("Anti-spoofing check",     "Spoof suspected — denied"),
@@ -1112,7 +1112,7 @@ elif page == "Security Terminal":
                     "Waiting for face",
                     "Face stability check",
                     "Blink liveness check",
-                    "Scanning animation",
+                    "Scanning face",
                     "Tailgating detection",
                     "Anti-spoofing check",
                     "Blacklist check",
@@ -1829,6 +1829,7 @@ elif page == "Live Camera":
         cap_ref = st.session_state.pop("cam_cap", None)
         if cap_ref is not None:
             cap_ref.release()
+        st.rerun()
 
     _live_camera_loop()
 
