@@ -1662,17 +1662,6 @@ elif page == "Identify: Image":
                 else:
                     st.error(f"DENY — {decision['label']} — {decision['reason']}")
 
-
-        # ── Background Model / Foreground Mask ────────────────────────────────
-        st.divider()
-        with st.expander(":material/layers: Background model — foreground mask", expanded=False):
-            st.caption(
-                "MOG2 foreground mask after binary morphological operations "
-                "(closing + dilation). White pixels = detected moving foreground."
-            )
-            st.image(fg_mask, caption="MOG2 foreground mask (post-morphology)",
-                     use_container_width=True)
-
         # ── KNN Secondary Verification ─────────────────────────────────────────
         if feat_list and any(f is not None for f in feat_list):
             st.divider()
@@ -1970,105 +1959,105 @@ elif page == "Admin Panel":
                 update_password(pw_uname, new_pw)
                 st.success(f"Password updated for `{pw_uname}`.")
 
-    st.divider()
+    # st.divider()
 
-    # ── Benchmark ─────────────────────────────────────────────────────────────
-    st.subheader(":material/analytics: Recognition Benchmark")
-    st.caption(
-        "Runs face recognition on every image in known_faces/ and reports "
-        "top-1 accuracy, average confidence, and per-frame latency. "
-        "Use these numbers in the Experiments and Results section of the report."
-    )
+    # # ── Benchmark ─────────────────────────────────────────────────────────────
+    # st.subheader(":material/analytics: Recognition Benchmark")
+    # st.caption(
+    #     "Runs face recognition on every image in known_faces/ and reports "
+    #     "top-1 accuracy, average confidence, and per-frame latency. "
+    #     "Use these numbers in the Experiments and Results section of the report."
+    # )
 
-    if st.button("Run Benchmark", icon=":material/play_arrow:",
-                 disabled=not knn_is_ready()):
-        if not knn_is_ready():
-            st.warning("Train the KNN model first.")
-        else:
-            # Load all enrolled encodings once — avoids repeated DB queries
-            enrolled = get_all_face_encodings()   # [{username, name, role, encoding}]
+    # if st.button("Run Benchmark", icon=":material/play_arrow:",
+    #              disabled=not knn_is_ready()):
+    #     if not knn_is_ready():
+    #         st.warning("Train the KNN model first.")
+    #     else:
+    #         # Load all enrolled encodings once — avoids repeated DB queries
+    #         enrolled = get_all_face_encodings()   # [{username, name, role, encoding}]
 
-            total = correct_resnet = correct_knn = 0
-            lat_sum = 0.0
-            rows = []
+    #         total = correct_resnet = correct_knn = 0
+    #         lat_sum = 0.0
+    #         rows = []
 
-            scan_dir = KNOWN_FACES_DIR
-            for username in sorted(os.listdir(scan_dir)):
-                user_dir = os.path.join(scan_dir, username)
-                if not os.path.isdir(user_dir):
-                    continue
-                imgs = sorted(
-                    f for f in os.listdir(user_dir)
-                    if f.lower().endswith((".jpg", ".jpeg", ".png"))
-                )
-                for img_name in imgs:
-                    path = os.path.join(user_dir, img_name)
-                    try:
-                        raw = open(path, "rb").read()
-                        bgr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-                        if bgr is None:
-                            continue
-                        t0  = time.time()
-                        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                        locs = face_recognition.face_locations(rgb, model="hog")
-                        if not locs:
-                            continue
-                        encs = face_recognition.face_encodings(rgb, locs)
-                        if not encs:
-                            continue
+    #         scan_dir = KNOWN_FACES_DIR
+    #         for username in sorted(os.listdir(scan_dir)):
+    #             user_dir = os.path.join(scan_dir, username)
+    #             if not os.path.isdir(user_dir):
+    #                 continue
+    #             imgs = sorted(
+    #                 f for f in os.listdir(user_dir)
+    #                 if f.lower().endswith((".jpg", ".jpeg", ".png"))
+    #             )
+    #             for img_name in imgs:
+    #                 path = os.path.join(user_dir, img_name)
+    #                 try:
+    #                     raw = open(path, "rb").read()
+    #                     bgr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    #                     if bgr is None:
+    #                         continue
+    #                     t0  = time.time()
+    #                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    #                     locs = face_recognition.face_locations(rgb, model="hog")
+    #                     if not locs:
+    #                         continue
+    #                     encs = face_recognition.face_encodings(rgb, locs)
+    #                     if not encs:
+    #                         continue
 
-                        # ResNet nearest-neighbour match against enrolled encodings
-                        best_match = None
-                        best_conf  = 0.0
-                        for u in enrolled:
-                            dist = float(np.linalg.norm(
-                                np.array(u["encoding"]) - np.array(encs[0])
-                            ))
-                            conf = max(0.0, 1.0 - dist)
-                            if conf > best_conf:
-                                best_conf  = conf
-                                best_match = u["username"]
+    #                     # ResNet nearest-neighbour match against enrolled encodings
+    #                     best_match = None
+    #                     best_conf  = 0.0
+    #                     for u in enrolled:
+    #                         dist = float(np.linalg.norm(
+    #                             np.array(u["encoding"]) - np.array(encs[0])
+    #                         ))
+    #                         conf = max(0.0, 1.0 - dist)
+    #                         if conf > best_conf:
+    #                             best_conf  = conf
+    #                             best_match = u["username"]
 
-                        lat       = (time.time() - t0) * 1000
-                        resnet_ok = (best_match == username)
+    #                     lat       = (time.time() - t0) * 1000
+    #                     resnet_ok = (best_match == username)
 
-                        # KNN match
-                        feats    = extract_all(bgr, locs[0])
-                        knn_ok   = False
-                        knn_pred = "—"
-                        if feats:
-                            knn_pred, _ = predict_knn(feats["feature_vector"])
-                            knn_ok = (knn_pred == username)
+    #                     # KNN match
+    #                     feats    = extract_all(bgr, locs[0])
+    #                     knn_ok   = False
+    #                     knn_pred = "—"
+    #                     if feats:
+    #                         knn_pred, _ = predict_knn(feats["feature_vector"])
+    #                         knn_ok = (knn_pred == username)
 
-                        total          += 1
-                        correct_resnet += int(resnet_ok)
-                        correct_knn    += int(knn_ok)
-                        lat_sum        += lat
-                        rows.append({
-                            "User (GT)":      username,
-                            "File":           img_name,
-                            "ResNet pred":    best_match or "—",
-                            "ResNet ✓/✗":    "✓" if resnet_ok else "✗",
-                            "KNN pred":       knn_pred or "—",
-                            "KNN ✓/✗":       "✓" if knn_ok else "✗",
-                            "Confidence":     f"{best_conf:.1%}",
-                            "Latency (ms)":   f"{lat:.1f}",
-                        })
-                    except Exception:
-                        continue
+    #                     total          += 1
+    #                     correct_resnet += int(resnet_ok)
+    #                     correct_knn    += int(knn_ok)
+    #                     lat_sum        += lat
+    #                     rows.append({
+    #                         "User (GT)":      username,
+    #                         "File":           img_name,
+    #                         "ResNet pred":    best_match or "—",
+    #                         "ResNet ✓/✗":    "✓" if resnet_ok else "✗",
+    #                         "KNN pred":       knn_pred or "—",
+    #                         "KNN ✓/✗":       "✓" if knn_ok else "✗",
+    #                         "Confidence":     f"{best_conf:.1%}",
+    #                         "Latency (ms)":   f"{lat:.1f}",
+    #                     })
+    #                 except Exception:
+    #                     continue
 
-            if total == 0:
-                st.warning("No images with detectable faces found in known_faces/.")
-            else:
-                import pandas as pd
-                acc_r = correct_resnet / total
-                acc_k = correct_knn    / total
-                b1, b2, b3, b4 = st.columns(4)
-                b1.metric("Images tested",         total)
-                b2.metric("ResNet top-1 accuracy", f"{acc_r:.1%}")
-                b3.metric("KNN top-1 accuracy",    f"{acc_k:.1%}")
-                b4.metric("Avg latency / frame",   f"{lat_sum / total:.1f} ms")
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, height=320)
+    #         if total == 0:
+    #             st.warning("No images with detectable faces found in known_faces/.")
+    #         else:
+    #             import pandas as pd
+    #             acc_r = correct_resnet / total
+    #             acc_k = correct_knn    / total
+    #             b1, b2, b3, b4 = st.columns(4)
+    #             b1.metric("Images tested",         total)
+    #             b2.metric("ResNet top-1 accuracy", f"{acc_r:.1%}")
+    #             b3.metric("KNN top-1 accuracy",    f"{acc_k:.1%}")
+    #             b4.metric("Avg latency / frame",   f"{lat_sum / total:.1f} ms")
+    #             st.dataframe(pd.DataFrame(rows), use_container_width=True, height=320)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
