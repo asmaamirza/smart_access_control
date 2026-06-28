@@ -676,6 +676,121 @@ def _live_camera_loop():
     time.sleep(0.03)
     st.rerun()   # fragment-scoped: sidebar and other pages are untouched
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENROLLMENT CAMERA FRAGMENT
+# Defined at module level (like _live_camera_loop) so Streamlit tracks it
+# across reruns. Drives one EnrollmentSession through the pose sequence.
+# ═══════════════════════════════════════════════════════════════════════════════
+@st.fragment
+def _enroll_camera_loop():
+    session = st.session_state["enroll_session"]
+
+    if "enroll_cap" not in st.session_state:
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not cap.isOpened():
+            st.error("Cannot open webcam. Check camera permissions.")
+            return
+        st.session_state["enroll_cap"] = cap
+
+    cap = st.session_state["enroll_cap"]
+    cap.grab(); cap.grab()
+    ret, frame = cap.read()
+
+    if not ret:
+        st.warning("Failed to read frame from webcam.")
+        time.sleep(0.05)
+        st.rerun()
+        return
+
+    outcome = session.process_frame(frame)
+    annotated = frame.copy()
+
+    # ── Draw face box + status, mirroring draw_rbac_result's visual language ──
+    box = outcome["face_box"]
+    if box:
+        _STATUS_COLOR = {
+            "no_face":        (160, 160, 160),
+            "blurry":         (0, 140, 255),
+            "spoof_rejected": (0, 80, 255),
+            "pose_mismatch":  (0, 200, 255),
+            "cooldown":       (0, 200, 255),
+            "captured":       (0, 200, 0),
+            "pose_complete":  (0, 220, 0),
+            "enrollment_complete": (0, 220, 0),
+        }
+        color = _STATUS_COLOR.get(outcome["status"], (200, 200, 200))
+        cv2.rectangle(annotated, (box["left"], box["top"]),
+                      (box["right"], box["bottom"]), color, 2)
+
+    col_feed, col_panel = st.columns([3, 2])
+
+    with col_feed:
+        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+    with col_panel:
+        pose = outcome["pose"]
+        if pose is not None:
+            st.markdown(f"### :material/face: {pose.instruction}")
+            st.progress(min(pose.collected / pose.target, 1.0),
+                       text=f"{pose.collected}/{pose.target} samples for this pose")
+        else:
+            st.markdown("### :material/check_circle: All poses captured")
+
+        st.progress(
+            min(outcome["total_collected"] / outcome["total_target"], 1.0)
+            if outcome["total_target"] else 0.0,
+            text=f"Overall: {outcome['total_collected']}/{outcome['total_target']} samples",
+        )
+
+        st.divider()
+
+        _MSG_STYLE = {
+            "no_face":             st.warning,
+            "blurry":              st.warning,
+            "spoof_rejected":      st.error,
+            "pose_mismatch":       st.info,
+            "cooldown":            st.info,
+            "captured":            st.success,
+            "pose_complete":       st.success,
+            "enrollment_complete": st.success,
+        }
+        _MSG_STYLE.get(outcome["status"], st.info)(outcome["message"])
+
+        st.caption(
+            "Sequence: " + "  →  ".join(
+                ("✅ " if p.done else ("▶ " if p is pose else "· ")) + p.instruction.split()[-1]
+                for p in session.poses
+            )
+        )
+
+        st.divider()
+        if pose is not None and pose.collected > 0:
+            if st.button("Redo this pose", icon=":material/refresh:", use_container_width=True):
+                session.reset_current_pose()
+
+    # ── Enrollment complete → finalize and persist ────────────────────────────
+    if outcome["status"] == "enrollment_complete":
+        password = st.session_state.pop("enroll_pending_password", None)
+        with st.spinner("Averaging encodings and saving to database…"):
+            ok, msg = session.finalize(password=password)
+            if ok:
+                train_knn()  # keep diagnostic KNN in sync; never blocks enrollment
+        cap_ref = st.session_state.pop("enroll_cap", None)
+        if cap_ref:
+            cap_ref.release()
+        st.session_state.update({
+            "enroll_state":     "result",
+            "enroll_result_ok": ok,
+            "enroll_result_msg": msg,
+        })
+        st.rerun()
+        return
+
+    time.sleep(0.03)
+    st.rerun()  # fragment-scoped: rest of the page/sidebar untouched
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TERMINAL PIPELINE — state-machine MFA verification for Security Terminal
@@ -1233,180 +1348,134 @@ elif page == "Security Terminal":
 # ═══════════════════════════════════════════════════════════════════════════════
 # REGISTER USER
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# REGISTER USER  —  LIVE CAMERA ENROLLMENT
+#
+# Replaces the old "upload 3-5 images" flow entirely. No known_faces/ folder,
+# no KNN training here — the user walks through a guided pose sequence in
+# front of the webcam, each frame is quality-filtered (face present, live,
+# not blurry, correct pose), and once enough samples exist per pose the
+# resulting encodings are averaged into one 128-d vector and written straight
+# to the DB via create_user() / update_face_encoding().
+#
+# Structured as an @st.fragment camera loop, exactly like _live_camera_loop()
+# and the Security Terminal face-scan step elsewhere in this file — same
+# cv2.VideoCapture lifecycle, same st.rerun()-scoped-to-fragment pattern.
+# ═══════════════════════════════════════════════════════════════════════════════
 elif page == "Register User":
     st.markdown("# :material/person_add: Register User")
+    st.caption("Live camera enrollment — no photo uploads. Look at the camera and follow the prompts.")
 
-    if "reg_n" not in st.session_state:
-        st.session_state.reg_n = 0
-    n = st.session_state.reg_n
+    tab_enroll, tab_blacklist = st.tabs(["Enroll via Live Camera", "Blacklist Entry"])
 
-    tab_manual, tab_blacklist, tab_bulk = st.tabs(
-        ["Enroll Authorized User", "Blacklist Entry", "Bulk Import — Pins Dataset"]
-    )
+    # ── Tab 1: Live camera enrollment ──────────────────────────────────────────
+    with tab_enroll:
+        enroll_state = st.session_state.get("enroll_state", "details")
 
-    # ── Tab 1: Enroll authorized / admin user ─────────────────────────────────
-    with tab_manual:
-        st.subheader("Create a new authorized user account")
-        col_form, col_info = st.columns([3, 2], gap="large")
+        # ── Step 1: collect identity details before opening the camera ────────
+        if enroll_state == "details":
+            st.markdown("#### Step 1 of 2 — Account details")
+            col_form, col_info = st.columns([3, 2], gap="large")
 
-        with col_form:
-            name      = st.text_input("Full name",  placeholder="e.g. Alice Smith",  key=f"reg_name_{n}")
-            username  = st.text_input("Username",   placeholder="e.g. alice",          key=f"reg_uname_{n}")
-            password  = st.text_input("Password",   type="password",
-                                      placeholder="Min 8 chars, upper, lower, special", key=f"reg_pw_{n}")
-            role      = st.selectbox("Role", ["authorized", "admin"],                  key=f"reg_role_{n}")
-            photos    = st.file_uploader(
-                "Face photos (3–5 recommended)",
-                type=["jpg", "jpeg", "png"],
-                accept_multiple_files=True,
-                key=f"reg_photos_{n}",
-            )
+            with col_form:
+                e_name     = st.text_input("Full name", placeholder="e.g. Alice Smith", key="enroll_name")
+                e_username = st.text_input("Username",  placeholder="e.g. alice",         key="enroll_username")
+                e_password = st.text_input("Password",  type="password",
+                                           placeholder="Min 8 chars, upper, lower, special",
+                                           key="enroll_password")
+                e_role     = st.selectbox("Role", ["authorized", "admin"], key="enroll_role")
 
-            # ── Photo preview with face detection ─────────────────────────────
-            if photos:
-                st.markdown("**Preview — face detection per photo:**")
-                prev_cols = st.columns(min(len(photos), 5))
-                any_missing = False
-                for _pi, _uf in enumerate(photos[:5]):
-                    _raw  = np.frombuffer(_uf.read(), np.uint8)
-                    _uf.seek(0)
-                    _bgr  = cv2.imdecode(_raw, cv2.IMREAD_COLOR)
-                    if _bgr is None:
-                        continue
-                    _rgb  = cv2.cvtColor(_bgr, cv2.COLOR_BGR2RGB)
-                    _locs = face_recognition.face_locations(_rgb, model="hog")
-                    _prev = _bgr.copy()
-                    for (_t, _r, _b, _l) in _locs:
-                        cv2.rectangle(_prev, (_l, _t), (_r, _b), (0, 200, 0), 2)
-                    if not _locs:
-                        any_missing = True
-                    prev_cols[_pi].image(
-                        cv2.cvtColor(_prev, cv2.COLOR_BGR2RGB),
-                        caption=f"{'Face OK' if _locs else 'No face!'} ({len(_locs)})",
-                        use_container_width=True,
-                    )
-                if any_missing:
-                    st.warning("Some photos have no detected face — they will be skipped.")
-
-            # ── Password strength check ───────────────────────────────────────
-            pw_errors = []
-            if password:
-                if len(password) < 8:
-                    pw_errors.append("at least 8 characters")
-                if not any(c.islower() for c in password):
-                    pw_errors.append("a lowercase letter")
-                if not any(c.isupper() for c in password):
-                    pw_errors.append("an uppercase letter")
-                if not any(c in "!@#$%^&*()_+-=[]{}|;':\",./<>?" for c in password):
-                    pw_errors.append("a special character (!@#$%…)")
-
-                if pw_errors:
-                    st.error("Password must contain: " + ", ".join(pw_errors))
-                else:
-                    st.success("Password strength: OK")
-
-            pw_valid = password and not pw_errors
-            ready = bool(name and username and pw_valid and photos)
-            if st.button("Register", type="primary", icon=":material/how_to_reg:",
-                         disabled=not ready):
-
-                with st.status("Running enrolment pipeline…", expanded=True) as status:
-                    prog = st.progress(0.0)
-
-                    st.write("Saving face images…")
-                    person_dir = os.path.join(KNOWN_FACES_DIR, username.strip())
-                    os.makedirs(person_dir, exist_ok=True)
-                    saved_paths = []
-                    for uf in photos:
-                        dst = os.path.join(person_dir, uf.name)
-                        with open(dst, "wb") as f:
-                            f.write(uf.read())
-                        saved_paths.append(dst)
-                    prog.progress(0.20)
-                    st.write(f"Saved {len(saved_paths)} image(s)")
-
-                    st.write("Detecting faces…")
-                    enc = extract_average_encoding(saved_paths)
-                    prog.progress(0.50)
-                    if enc is None:
-                        st.error("No faces detected. Try clearer images.")
-                        status.update(label="Enrolment failed", state="error")
-                        st.stop()
-                    st.write("Faces detected and encoded")
-
-                    st.write("Extracting classical features (Canny, LBP, HOG)…")
-                    sample_bgr = cv2.imdecode(
-                        np.frombuffer(open(saved_paths[0], "rb").read(), np.uint8),
-                        cv2.IMREAD_COLOR,
-                    )
-                    sample_rgb  = cv2.cvtColor(sample_bgr, cv2.COLOR_BGR2RGB)
-                    locs        = face_recognition.face_locations(sample_rgb, model="hog")
-                    sample_feat = extract_all(sample_bgr, locs[0]) if locs else None
-                    prog.progress(0.75)
-                    st.write("Classical descriptors extracted")
-
-                    st.write("Storing in database…")
-                    ok, msg = create_user(name.strip(), username.strip(), password, role, enc)
-                    prog.progress(1.0)
-
-                    _knn_ok  = False
-                    _knn_msg = ""
-                    if ok:
-                        st.write("User created successfully.")
-                        st.write("Updating KNN classifier with new face data…")
-                        _knn_ok, _knn_msg = train_knn()
-                        if _knn_ok:
-                            st.write(f"KNN updated: {_knn_msg}")
-                        else:
-                            st.write(f"KNN retraining warning: {_knn_msg}")
-                        prog.progress(1.0)
-                        status.update(label="Enrolment complete!", state="complete")
+                pw_errors = []
+                if e_password:
+                    if len(e_password) < 8:
+                        pw_errors.append("at least 8 characters")
+                    if not any(c.islower() for c in e_password):
+                        pw_errors.append("a lowercase letter")
+                    if not any(c.isupper() for c in e_password):
+                        pw_errors.append("an uppercase letter")
+                    if not any(c in "!@#$%^&*()_+-=[]{}|;':\",./<>?" for c in e_password):
+                        pw_errors.append("a special character (!@#$%…)")
+                    if pw_errors:
+                        st.error("Password must contain: " + ", ".join(pw_errors))
                     else:
-                        st.error(msg)
-                        status.update(label="Enrolment failed", state="error")
-                        st.stop()
+                        st.success("Password strength: OK")
 
-                st.success(msg)
-                if not _knn_ok and ok:
-                    st.warning(
-                        f"KNN retraining failed ({_knn_msg}). "
-                        "Use **Admin Panel → Retrain KNN Model** to update manually."
-                    )
+                ready = bool(e_name and e_username and e_password and not pw_errors)
+                if st.button("Start Live Enrollment", type="primary",
+                             icon=":material/videocam:", disabled=not ready,
+                             use_container_width=True):
+                    from modules.live_enrollment import EnrollmentSession
+                    st.session_state.update({
+                        "enroll_state":    "camera",
+                        "enroll_session":  EnrollmentSession(
+                            username=e_username.strip(), name=e_name.strip(), role=e_role,
+                        ),
+                        "enroll_pending_password": e_password,
+                    })
+                    reset_background_model()
+                    st.rerun()
 
-                if sample_feat:
-                    st.subheader("Classical feature outputs")
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.image(sample_feat["gray_chip"],  caption="Aligned face (64x64)", clamp=True)
-                    c2.image(sample_feat["canny_map"],  caption="Canny edge map",       clamp=True)
-                    lbp_vis = cv2.normalize(sample_feat["lbp_image"], None, 0, 255,
-                                            cv2.NORM_MINMAX).astype(np.uint8)
-                    c3.image(lbp_vis, caption="LBP texture pattern", clamp=True)
-                    c4.image(sample_feat["hog_vis"], caption="HOG gradient image", clamp=True)
+            with col_info:
+                st.markdown("""
+**How live enrollment works**
+1. Open the camera and follow each prompt:
+   *Look straight → Left → Right → Up → Down*
+2. Every frame is checked for:
+   - a real face (HOG detector)
+   - liveness (texture + sharpness — same anti-spoofing
+     checks used at login)
+   - the requested head pose
+3. Only frames that pass all checks are kept.
+4. Once every pose has enough good samples, all
+   encodings are averaged into a single 128-d identity
+   vector and stored directly in the database.
 
-        with col_info:
-            if st.button("Clear everything", icon=":material/refresh:", type="secondary"):
-                st.session_state.reg_n += 1
+> No photos are saved to disk and no classifier is
+> trained — the database itself is the model, exactly
+> as for everyday recognition.
+                """)
+
+        # ── Step 2: live camera capture loop ───────────────────────────────────
+        elif enroll_state == "camera":
+            session = st.session_state["enroll_session"]
+            st.markdown(f"#### Step 2 of 2 — Live capture for **{session.name}**")
+
+            col_ctrl, _ = st.columns([2, 3])
+            with col_ctrl:
+                if st.button("Cancel enrollment", icon=":material/cancel:"):
+                    cap_ref = st.session_state.pop("enroll_cap", None)
+                    if cap_ref:
+                        cap_ref.release()
+                    for k in ("enroll_state", "enroll_session", "enroll_pending_password"):
+                        st.session_state.pop(k, None)
+                    st.rerun()
+
+            _enroll_camera_loop()
+
+        # ── Step 3: finalize / result ───────────────────────────────────────────
+        elif enroll_state == "result":
+            result_ok  = st.session_state.get("enroll_result_ok", False)
+            result_msg = st.session_state.get("enroll_result_msg", "")
+            if result_ok:
+                st.success(f":material/check_circle: {result_msg}")
+            else:
+                st.error(f":material/error: {result_msg}")
+
+            if st.button("Enroll another user", icon=":material/person_add:", type="primary"):
+                for k in ("enroll_state", "enroll_session", "enroll_pending_password",
+                          "enroll_result_ok", "enroll_result_msg"):
+                    st.session_state.pop(k, None)
                 st.rerun()
-            st.markdown("""
-**Role descriptions**
 
-| Role | Access |
-|---|---|
-| `authorized` | Standard access — green box |
-| `admin` | Full access — gold box |
-
-**Tips for good enrolment**
-- Use 3–5 photos with varied lighting
-- Face clearly visible and front-facing
-- Avoid sunglasses or heavy obstructions
-
-> Threat individuals are enrolled separately
-> via the **Blacklist Entry** tab — they do not
-> get a username or system credentials.
-            """)
-
-    # ── Tab 2: Blacklist entry (no credentials required) ─────────────────────
+    # ── Tab 2: Blacklist entry — UNCHANGED, still photo-based by design ───────
+    # Blacklist subjects are not cooperative enrollees (they are threats being
+    # flagged from captured footage), so a live guided-pose camera flow doesn't
+    # apply here. This keeps the existing upload-based blacklist path as-is.
     with tab_blacklist:
+        if "bl_n" not in st.session_state:
+            st.session_state.bl_n = 0
+        bn = st.session_state.bl_n
+
         st.subheader("Add a threat individual to the blacklist")
         st.caption(
             "Blacklisted identities are stored separately from authorized users. "
@@ -1418,20 +1487,20 @@ elif page == "Register User":
         with col_bl:
             bl_name   = st.text_input("Name / Label",
                                       placeholder="e.g. John Doe or Unknown Male #1",
-                                      key=f"bl_name_{n}")
+                                      key=f"bl_name_{bn}")
             bl_reason = st.selectbox("Threat reason",
                                      ["Trespassing", "Banned employee",
                                       "Flagged intruder", "Court order",
                                       "Other security threat"],
-                                     key=f"bl_reason_{n}")
+                                     key=f"bl_reason_{bn}")
             bl_notes  = st.text_area("Additional notes (optional)",
                                      placeholder="e.g. Attempted break-in on 2026-01-15",
-                                     key=f"bl_notes_{n}")
+                                     key=f"bl_notes_{bn}")
             bl_photos = st.file_uploader(
                 "Face photos (3–5 recommended)",
                 type=["jpg", "jpeg", "png"],
                 accept_multiple_files=True,
-                key=f"bl_photos_{n}",
+                key=f"bl_photos_{bn}",
             )
 
             bl_ready = bool(bl_name and bl_reason and bl_photos)
@@ -1486,86 +1555,6 @@ elif page == "Register User":
 3. On match: immediate **ALERT** — no further processing
 4. Blacklisted persons cannot authenticate via the Security Terminal
             """)
-
-    with tab_bulk:
-        st.subheader("Bulk Import — Pins Face Recognition (Kaggle)")
-        st.markdown("Dataset: **Pins Face Recognition** by herbi4rtz. "
-                    "Paste the path to the extracted `105_classes_pins_dataset` folder.")
-
-        dataset_path = st.text_input(
-            "Dataset root folder",
-            placeholder=r"C:\Users\Dell\smart_access_control\archive\105_classes_pins_dataset",
-            key=f"bulk_path_{n}",
-        )
-
-        if dataset_path and os.path.isdir(dataset_path):
-            pins_dirs = sorted(
-                d for d in os.listdir(dataset_path)
-                if d.startswith("pins_") and os.path.isdir(os.path.join(dataset_path, d))
-            )
-            if not pins_dirs:
-                st.warning("No `pins_*` folders found.")
-            else:
-                all_names = [d[5:] for d in pins_dirs]
-                col_a, col_b = st.columns([3, 1])
-                with col_a:
-                    selected = st.multiselect(
-                        f"Select people ({len(all_names)} available)",
-                        all_names, default=all_names[:6],
-                    )
-                with col_b:
-                    max_imgs    = st.slider("Images / person", 3, 15, 5)
-                    bulk_role   = st.selectbox("Assign role",
-                                               ["authorized", "admin"],
-                                               key="bulk_role")
-                    auto_enroll = st.checkbox("Auto-extract encodings", value=True)
-
-                if st.button("Import", type="primary",
-                             icon=":material/upload:", disabled=not selected):
-                    prog = st.progress(0.0)
-                    imported, skipped = 0, 0
-
-                    for i, name in enumerate(selected):
-                        src = os.path.join(dataset_path, f"pins_{name}")
-                        dst = os.path.join(KNOWN_FACES_DIR, name)
-                        os.makedirs(dst, exist_ok=True)
-
-                        imgs = sorted(
-                            f for f in os.listdir(src)
-                            if f.lower().endswith((".jpg", ".jpeg", ".png"))
-                        )[:max_imgs]
-                        for img in imgs:
-                            shutil.copy2(os.path.join(src, img), os.path.join(dst, img))
-
-                        uname = name.lower().replace(" ", "_")
-                        pw    = secrets.token_hex(8)
-
-                        enc = extract_average_encoding(
-                            [os.path.join(dst, f) for f in imgs]
-                        ) if auto_enroll else None
-
-                        ok, _ = create_user(name, uname, pw, bulk_role, enc)
-                        if ok:
-                            imported += 1
-                        else:
-                            if enc is not None:
-                                update_face_encoding(uname, enc)
-                            skipped += 1
-
-                        prog.progress((i + 1) / len(selected))
-
-                    st.success(
-                        f"Imported {imported} new user(s), updated {skipped} existing."
-                    )
-                    knn_ok, knn_msg = train_knn()
-                    if knn_ok:
-                        st.info(f"KNN retrained: {knn_msg}")
-                    st.rerun()
-
-        elif dataset_path:
-            st.error("Path does not exist.")
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # IDENTIFY: IMAGE
 # ═══════════════════════════════════════════════════════════════════════════════
