@@ -1386,7 +1386,7 @@ elif page == "Security Terminal":
 # ═══════════════════════════════════════════════════════════════════════════════
 elif page == "Register User":
     st.markdown("# :material/person_add: Register User")
-    st.caption("Live camera enrollment — no photo uploads. Look at the camera and follow the prompts.")
+    st.caption("Register a user through comprehensive live video capture.")
 
     tab_enroll, tab_blacklist = st.tabs(["Enroll via Live Camera", "Blacklist Entry"])
 
@@ -1715,10 +1715,6 @@ elif page == "Identify: Image":
                     if knn_user is None:
                         col_k1.metric(f"Face {i+1} — KNN (diagnostic)", "Unknown")
                         col_k2.metric("KNN confidence (raw)", f"{knn_conf:.0%}")
-                        col_k3.caption(
-                            ":material/info: Confidence below threshold — "
-                            "prediction rejected, result not used."
-                        )
                     else:
                         col_k1.metric(f"Face {i+1} — KNN (diagnostic)", knn_user)
                         col_k2.metric("KNN confidence", f"{knn_conf:.0%}")
