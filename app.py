@@ -759,12 +759,25 @@ def _enroll_camera_loop():
         }
         _MSG_STYLE.get(outcome["status"], st.info)(outcome["message"])
 
-        st.caption(
-            "Sequence: " + "  →  ".join(
-                ("✅ " if p.done else ("▶ " if p is pose else "· ")) + p.instruction.split()[-1]
-                for p in session.poses
+        # ── Pose stepper ──────────────────────────────────────────────────────
+        pose_html = "<div style='display:flex;gap:6px;flex-wrap:wrap;margin-top:4px'>"
+        for p in session.poses:
+            if p.done:
+                bg, border, tc, icon = "#0d2b0d", "#22cc44", "#22cc44", "✅"
+            elif p is pose:
+                bg, border, tc, icon = "#0d1b2b", "#1e90ff", "#1e90ff", "▶"
+            else:
+                bg, border, tc, icon = "transparent", "#444", "#888", "○"
+            label = p.instruction.split()[-1].capitalize()
+            pose_html += (
+                f"<div style='background:{bg};border:1px solid {border};"
+                f"border-radius:8px;padding:5px 10px;text-align:center;min-width:60px'>"
+                f"<div style='font-size:1rem'>{icon}</div>"
+                f"<div style='color:{tc};font-size:0.75rem;font-weight:600'>{label}</div>"
+                f"</div>"
             )
-        )
+        pose_html += "</div>"
+        st.markdown(pose_html, unsafe_allow_html=True)
 
         st.divider()
         if pose is not None and pose.collected > 0:
@@ -1015,6 +1028,10 @@ def _run_terminal_pipeline(frame_bgr: np.ndarray,
 # ═══════════════════════════════════════════════════════════════════════════════
 if page == "Home":
     st.markdown("# :material/home: Smart Access Control")
+    st.image(
+    "security_photo.jpg",
+    use_container_width=True,
+    )
     st.markdown("""
 A complete computer-vision RBAC pipeline demonstrating both classical and
 modern CV techniques integrated into a single, deployable web application.
@@ -1061,7 +1078,7 @@ modern CV techniques integrated into a single, deployable web application.
 # ═══════════════════════════════════════════════════════════════════════════════
 elif page == "Security Terminal":
     st.markdown("# :material/fingerprint: Security Terminal")
-    st.caption("Two-factor authentication — credentials verified first, then face scan.")
+    st.caption("Two-factor authentication using credentials and face scan.")
 
     if "terminal_state" not in st.session_state:
         st.session_state["terminal_state"] = "credentials"
@@ -1424,20 +1441,12 @@ elif page == "Register User":
                 st.markdown("""
 **How live enrollment works**
 1. Open the camera and follow each prompt:
-   *Look straight → Left → Right → Up → Down*
-2. Every frame is checked for:
-   - a real face (HOG detector)
-   - liveness (texture + sharpness — same anti-spoofing
-     checks used at login)
-   - the requested head pose
+   *Look straight -> Left -> Right -> Up -> Down*
+2. Every frame is checked for a real face, liveness,
+    and if it's following the requested pose.
 3. Only frames that pass all checks are kept.
-4. Once every pose has enough good samples, all
-   encodings are averaged into a single 128-d identity
-   vector and stored directly in the database.
-
-> No photos are saved to disk and no classifier is
-> trained — the database itself is the model, exactly
-> as for everyday recognition.
+4. Once every pose has good samples,
+    you can register the user.
                 """)
 
         # ── Step 2: live camera capture loop ───────────────────────────────────
@@ -1672,9 +1681,8 @@ elif page == "Identify: Image":
             st.divider()
             st.subheader(":material/model_training: KNN Secondary Verification")
             st.caption(
-                "Classical KNN classifier (Canny + LBP + HOG features) — diagnostic only. "
+                "Classical KNN classifier (Canny + LBP + HOG features) is diagnostic only. "
                 "The final access decision is based on the primary ResNet/RBAC pipeline. "
-                "KNN output is shown for comparison and is **never** used to override the decision."
             )
 
             if not knn_is_ready():
@@ -1753,11 +1761,10 @@ elif page == "Identify: Image":
 elif page == "Live Camera":
     st.markdown("# :material/videocam: Live Camera — Testing Mode")
     st.caption(
-        "Testing live camera feed. Blink once to confirm liveness. "
-        "**Events from this page are not recorded in the access log.**"
+        "Testing live camera feed."
     )
     st.info(
-        ":material/science: This page is for testing and development only. "
+        "This page is for testing and development only. "
         "Detection results are displayed visually but are **not** written to the access log. "
         "Use the **Security Terminal** for authenticated access events.",
         icon=":material/info:",
@@ -1903,8 +1910,7 @@ elif page == "Admin Panel":
     st.subheader(":material/block: Blacklist Management")
     bl_entries = get_all_blacklist_entries()
     st.caption(
-        f"{len(bl_entries)} blacklisted individual(s) — "
-        "their face encodings are checked first in every pipeline."
+        f"{len(bl_entries)} blacklisted individual(s)"
     )
 
     if not bl_entries:

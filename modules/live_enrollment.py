@@ -103,7 +103,7 @@ POSE_SEQUENCE = [
     ("left",     "Turn your head to the LEFT"),
     ("right",    "Turn your head to the RIGHT"),
     ("up",       "Tilt your head UP"),
-    ("down",     "Tilt your head DOWN — just slightly, a little goes a long way"),
+    ("down",     "Tilt your head DOWN"),
 ]
 
 # Samples required per pose before advancing
@@ -213,7 +213,7 @@ class EnrollmentSession:
             if pose.key == "down" and self._consecutive_no_face <= 5 and self._frame_n > 1:
                 return self._result(
                     "no_face", None,
-                    "Lost the face — that's too far. Ease off the tilt, just a small dip.",
+                    "Lost the face, ease off the tilt.",
                     pose,
                 )
             return self._result("no_face", None, "No face detected — center your face.", pose)
