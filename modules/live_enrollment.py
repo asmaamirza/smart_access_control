@@ -94,7 +94,7 @@ from modules.anti_spoofing import static_spoof_check
 from modules.database import create_user, update_face_encoding
 from modules.knn_engine import train_knn
 
-KNOWN_FACES_DIR = "known_faces"
+KNOWN_FACES_DIR = "database/known_faces"
 
 # ── Pose sequence ─────────────────────────────────────────────────────────────
 # Each pose: (key, instruction shown to the user, validator name)

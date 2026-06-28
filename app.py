@@ -38,7 +38,7 @@ from modules.utils             import (
     draw_rbac_result, draw_scanning_bar, draw_spoof_badge, stamp_ear, stamp_status,
 )
 
-KNOWN_FACES_DIR = "known_faces"
+KNOWN_FACES_DIR = "database/known_faces"
 
 # ── Stability / stillness gate constants ──────────────────────────────────────
 STABILITY_MOVEMENT_THRESHOLD = 12    # max center-pixel displacement between frames
@@ -789,116 +789,6 @@ def _enroll_camera_loop():
         st.session_state.update({
             "enroll_state":      "result",
             "enroll_result_ok":  ok,
-            "enroll_result_msg": msg,
-        })
-        st.rerun()
-        return
-
-    time.sleep(0.03)
-    st.rerun()  # fragment-scoped: rest of the page/sidebar untouched
-    session = st.session_state["enroll_session"]
-
-    if "enroll_cap" not in st.session_state:
-        cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        if not cap.isOpened():
-            st.error("Cannot open webcam. Check camera permissions.")
-            return
-        st.session_state["enroll_cap"] = cap
-
-    cap = st.session_state["enroll_cap"]
-    cap.grab(); cap.grab()
-    ret, frame = cap.read()
-
-    if not ret:
-        st.warning("Failed to read frame from webcam.")
-        time.sleep(0.05)
-        st.rerun()
-        return
-
-    outcome = session.process_frame(frame)
-    annotated = frame.copy()
-
-    # ── Draw face box + status, mirroring draw_rbac_result's visual language ──
-    box = outcome["face_box"]
-    if box:
-        _STATUS_COLOR = {
-            "no_face":        (160, 160, 160),
-            "blurry":         (0, 140, 255),
-            "spoof_rejected": (0, 80, 255),
-            "pose_mismatch":  (0, 200, 255),
-            "cooldown":       (0, 200, 255),
-            "captured":       (0, 200, 0),
-            "pose_complete":  (0, 220, 0),
-            "enrollment_complete": (0, 220, 0),
-        }
-        color = _STATUS_COLOR.get(outcome["status"], (200, 200, 200))
-        cv2.rectangle(annotated, (box["left"], box["top"]),
-                      (box["right"], box["bottom"]), color, 2)
-
-    col_feed, col_panel = st.columns([3, 2])
-
-    with col_feed:
-        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), use_container_width=True)
-
-    with col_panel:
-        pose = outcome["pose"]
-        if pose is not None:
-            st.markdown(f"### :material/face: {pose.instruction}")
-            st.progress(min(pose.collected / pose.target, 1.0),
-                       text=f"{pose.collected}/{pose.target} samples for this pose")
-        else:
-            st.markdown("### :material/check_circle: All poses captured")
-
-        st.progress(
-            min(outcome["total_collected"] / outcome["total_target"], 1.0)
-            if outcome["total_target"] else 0.0,
-            text=f"Overall: {outcome['total_collected']}/{outcome['total_target']} samples",
-        )
-
-        st.divider()
-
-        _MSG_STYLE = {
-            "no_face":             st.warning,
-            "blurry":              st.warning,
-            "spoof_rejected":      st.error,
-            "pose_mismatch":       st.info,
-            "cooldown":            st.info,
-            "captured":            st.success,
-            "pose_complete":       st.success,
-            "enrollment_complete": st.success,
-        }
-        _MSG_STYLE.get(outcome["status"], st.info)(outcome["message"])
-
-        st.caption(
-            "Sequence: " + "  →  ".join(
-                ("✅ " if p.done else ("▶ " if p is pose else "· ")) + p.instruction.split()[-1]
-                for p in session.poses
-            )
-        )
-
-        st.divider()
-        if pose is not None and pose.collected > 0:
-            if st.button("Redo this pose", icon=":material/refresh:", use_container_width=True):
-                session.reset_current_pose()
-
-    # ── Enrollment complete → finalize and persist ────────────────────────────
-        if outcome["status"] == "enrollment_complete":
-            password = st.session_state.pop("enroll_pending_password", None)
-            with st.spinner("Averaging encodings, saving, and training KNN…"):
-                ok, msg = session.finalize(password=password)
-                # train_knn() now runs INSIDE finalize() itself, since that's
-                # also where the captured images get saved to known_faces/.
-                # Calling it again here would just retrain on the same data
-                # for no reason.
-        cap_ref = st.session_state.pop("enroll_cap", None)
-        if cap_ref:
-            cap_ref.release()
-        st.session_state.update({
-            "enroll_state":     "result",
-            "enroll_result_ok": ok,
             "enroll_result_msg": msg,
         })
         st.rerun()
@@ -2074,105 +1964,112 @@ elif page == "Admin Panel":
                 update_password(pw_uname, new_pw)
                 st.success(f"Password updated for `{pw_uname}`.")
 
-    # st.divider()
+    st.divider()
 
-    # # ── Benchmark ─────────────────────────────────────────────────────────────
-    # st.subheader(":material/analytics: Recognition Benchmark")
-    # st.caption(
-    #     "Runs face recognition on every image in known_faces/ and reports "
-    #     "top-1 accuracy, average confidence, and per-frame latency. "
-    #     "Use these numbers in the Experiments and Results section of the report."
-    # )
+    # ── Benchmark ─────────────────────────────────────────────────────────────
+# ── Benchmark ─────────────────────────────────────────────────────────────
+    st.subheader(":material/analytics: Recognition Benchmark")
+    st.caption(
+        "Evaluates both recognisers on a **held-out test split** — each user's "
+        "images are split into a training portion (used to build that user's "
+        "reference encoding / fit the KNN) and a separate testing portion that "
+        "neither model ever sees during training. This avoids testing on the "
+        "same photos the models were built from, which would inflate accuracy "
+        "and hide real confusion between similar-looking enrolled users. "
+        "Results are averaged across multiple random splits; the ± figure is "
+        "the spread across those splits, not a margin of error in the usual "
+        "statistical sense — a small number of splits on a small dataset is "
+        "still a rough estimate, but it is an honest one."
+    )
 
-    # if st.button("Run Benchmark", icon=":material/play_arrow:",
-    #              disabled=not knn_is_ready()):
-    #     if not knn_is_ready():
-    #         st.warning("Train the KNN model first.")
-    #     else:
-    #         # Load all enrolled encodings once — avoids repeated DB queries
-    #         enrolled = get_all_face_encodings()   # [{username, name, role, encoding}]
+    bm_col1, bm_col2 = st.columns(2)
+    bm_test_fraction = bm_col1.slider(
+        "Held-out fraction per user", 0.1, 0.5, 0.3, step=0.05,
+        help="Fraction of each user's images reserved for testing, never used to build their encoding or fit the KNN.",
+    )
+    bm_n_splits = bm_col2.slider(
+        "Number of random splits", 1, 10, 5,
+        help="More splits give a more reliable average and a meaningful spread, at the cost of a longer run.",
+    )
 
-    #         total = correct_resnet = correct_knn = 0
-    #         lat_sum = 0.0
-    #         rows = []
+    if st.button("Run Benchmark", icon=":material/play_arrow:"):
+        from modules.benchmark import run_benchmark, MIN_IMAGES_PER_USER
 
-    #         scan_dir = KNOWN_FACES_DIR
-    #         for username in sorted(os.listdir(scan_dir)):
-    #             user_dir = os.path.join(scan_dir, username)
-    #             if not os.path.isdir(user_dir):
-    #                 continue
-    #             imgs = sorted(
-    #                 f for f in os.listdir(user_dir)
-    #                 if f.lower().endswith((".jpg", ".jpeg", ".png"))
-    #             )
-    #             for img_name in imgs:
-    #                 path = os.path.join(user_dir, img_name)
-    #                 try:
-    #                     raw = open(path, "rb").read()
-    #                     bgr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
-    #                     if bgr is None:
-    #                         continue
-    #                     t0  = time.time()
-    #                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    #                     locs = face_recognition.face_locations(rgb, model="hog")
-    #                     if not locs:
-    #                         continue
-    #                     encs = face_recognition.face_encodings(rgb, locs)
-    #                     if not encs:
-    #                         continue
+        bm_progress = st.progress(0.0)
+        bm_status_text = st.empty()
 
-    #                     # ResNet nearest-neighbour match against enrolled encodings
-    #                     best_match = None
-    #                     best_conf  = 0.0
-    #                     for u in enrolled:
-    #                         dist = float(np.linalg.norm(
-    #                             np.array(u["encoding"]) - np.array(encs[0])
-    #                         ))
-    #                         conf = max(0.0, 1.0 - dist)
-    #                         if conf > best_conf:
-    #                             best_conf  = conf
-    #                             best_match = u["username"]
+        def _bm_progress_cb(frac, msg):
+            bm_progress.progress(min(frac, 1.0))
+            bm_status_text.caption(msg)
 
-    #                     lat       = (time.time() - t0) * 1000
-    #                     resnet_ok = (best_match == username)
+        result = run_benchmark(
+            known_faces_dir=KNOWN_FACES_DIR,
+            test_fraction=bm_test_fraction,
+            n_splits=bm_n_splits,
+            progress_cb=_bm_progress_cb,
+        )
+        bm_progress.empty()
+        bm_status_text.empty()
 
-    #                     # KNN match
-    #                     feats    = extract_all(bgr, locs[0])
-    #                     knn_ok   = False
-    #                     knn_pred = "—"
-    #                     if feats:
-    #                         knn_pred, _ = predict_knn(feats["feature_vector"])
-    #                         knn_ok = (knn_pred == username)
+        if not result["ok"]:
+            st.warning(result["message"])
+            if result.get("excluded_users"):
+                st.caption(
+                    "Users excluded for too few images (need "
+                    f"{MIN_IMAGES_PER_USER}+): "
+                    + ", ".join(f"{e['username']} ({e['n_images']})" for e in result["excluded_users"])
+                )
+        else:
+            if result["excluded_users"]:
+                st.info(
+                    ":material/info: Excluded from this run (too few images, need "
+                    f"{MIN_IMAGES_PER_USER}+): "
+                    + ", ".join(f"{e['username']} ({e['n_images']})" for e in result["excluded_users"])
+                )
 
-    #                     total          += 1
-    #                     correct_resnet += int(resnet_ok)
-    #                     correct_knn    += int(knn_ok)
-    #                     lat_sum        += lat
-    #                     rows.append({
-    #                         "User (GT)":      username,
-    #                         "File":           img_name,
-    #                         "ResNet pred":    best_match or "—",
-    #                         "ResNet ✓/✗":    "✓" if resnet_ok else "✗",
-    #                         "KNN pred":       knn_pred or "—",
-    #                         "KNN ✓/✗":       "✓" if knn_ok else "✗",
-    #                         "Confidence":     f"{best_conf:.1%}",
-    #                         "Latency (ms)":   f"{lat:.1f}",
-    #                     })
-    #                 except Exception:
-    #                     continue
+            b1, b2, b3, b4 = st.columns(4)
+            b1.metric("Users benchmarked", len(result["usable_users"]))
+            b2.metric(
+                "ResNet held-out accuracy",
+                f"{result['resnet_acc_mean']:.1%}",
+                delta=f"±{result['resnet_acc_std']:.1%} across splits",
+                delta_color="off",
+            )
+            b3.metric(
+                "KNN held-out accuracy",
+                f"{result['knn_acc_mean']:.1%}",
+                delta=f"±{result['knn_acc_std']:.1%} across splits",
+                delta_color="off",
+            )
+            b4.metric("Avg latency / image", f"{result['avg_latency_ms']:.1f} ms")
 
-    #         if total == 0:
-    #             st.warning("No images with detectable faces found in known_faces/.")
-    #         else:
-    #             import pandas as pd
-    #             acc_r = correct_resnet / total
-    #             acc_k = correct_knn    / total
-    #             b1, b2, b3, b4 = st.columns(4)
-    #             b1.metric("Images tested",         total)
-    #             b2.metric("ResNet top-1 accuracy", f"{acc_r:.1%}")
-    #             b3.metric("KNN top-1 accuracy",    f"{acc_k:.1%}")
-    #             b4.metric("Avg latency / frame",   f"{lat_sum / total:.1f} ms")
-    #             st.dataframe(pd.DataFrame(rows), use_container_width=True, height=320)
+            st.caption(
+                f"{result['n_splits']} random splits · "
+                f"{result['test_fraction']:.0%} of each user's images held out per split · "
+                "confidence uses the same normalisation as live recognition "
+                "(distance 0 → 100%, distance 0.80 → 0%)."
+            )
+
+            with st.expander(":material/table_chart: Per-split breakdown", expanded=False):
+                import pandas as pd
+                split_df = pd.DataFrame(result["per_split"])
+                split_df.index.name = "split"
+                split_df = split_df.rename(columns={
+                    "resnet_acc": "ResNet accuracy", "knn_acc": "KNN accuracy",
+                    "n_test_images": "Test images", "avg_latency_ms": "Avg latency (ms)",
+                })
+                split_df["ResNet accuracy"] = split_df["ResNet accuracy"].map(lambda x: f"{x:.1%}")
+                split_df["KNN accuracy"]    = split_df["KNN accuracy"].map(lambda x: f"{x:.1%}")
+                split_df["Avg latency (ms)"] = split_df["Avg latency (ms)"].map(lambda x: f"{x:.1f}")
+                st.dataframe(split_df, use_container_width=True)
+
+            st.caption(
+                "Detail table below shows individual predictions from the **last** "
+                "split only (showing all splits would be unreadable) — illustrative, "
+                "not the basis for the headline accuracy numbers above."
+            )
+            import pandas as pd
+            st.dataframe(pd.DataFrame(result["rows"]), use_container_width=True, height=320)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

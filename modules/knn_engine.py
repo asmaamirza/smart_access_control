@@ -27,7 +27,7 @@ from modules.feature_extractor import extract_all
 MODELS_DIR      = "models"
 KNN_PATH        = os.path.join(MODELS_DIR, "knn_classifier.pkl")
 ENCODER_PATH    = os.path.join(MODELS_DIR, "label_encoder.pkl")
-KNOWN_FACES_DIR = "known_faces"
+KNOWN_FACES_DIR = "database/known_faces"
 
 # Minimum confidence for a KNN prediction to be considered reliable.
 # Predictions below this threshold are returned as (None, raw_conf) so callers
